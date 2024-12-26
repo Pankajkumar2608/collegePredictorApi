@@ -10,7 +10,11 @@ dotenv.config();
 
 const app = express();
 app.use(express.json());
-app.use(cors());
+app.use(cors({
+    origin: ["https://www.motivationkaksha.com", "https://motivationkaksha.com"],
+    credentials: true
+}));
+
 
 
 const pool = new Pool({
