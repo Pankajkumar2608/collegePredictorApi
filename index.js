@@ -91,16 +91,21 @@ app.post('/filter', async (req, res) => {
         filterQuery += ` ORDER BY "Opening Rank" ASC `;
     }
 
-    
+
 
     try {
         const result = await pool.query(filterQuery, params);
-        
+        if(!result.rows.length === 0){
+            res.status(200).json({
+                data: "No match found for the given criteria"
+            })
+        }
+
         res.status(200).json({
             filterData: result.rows
         });
     } catch (error) {
-        
+
         res.status(400).json({
             message: "Error in fetching data"
         });
