@@ -119,9 +119,7 @@ app.get('/suggest', async (req, res) => {
                  FROM public.combined_josaa_in
                  WHERE institute ILIKE '%${patterns}%'
                  ORDER BY institute ASC`
-            );
-            console.log(result.rows)    
-
+            );   
             res.json(result.rows.map(r => r.institute));
         } catch (error) {
             console.error("Autocomplete error:", error);
@@ -130,16 +128,13 @@ app.get('/suggest', async (req, res) => {
     }
     else{
         const patterns = searchTerms[1];
-        console.log(patterns)
         try {
             const result = await pool.query(
                 `SELECT DISTINCT institute 
                  FROM public.combined_josaa_in
                  WHERE institute ILIKE '%${patterns}%'
                  ORDER BY institute ASC`
-            );
-            console.log(result.rows)    
-
+            ); 
             res.json(result.rows.map(r => r.institute));
         } catch (error) {
             console.error("Autocomplete error:", error);
