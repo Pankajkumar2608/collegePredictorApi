@@ -101,45 +101,47 @@ app.post('/filter', async (req, res) => {
 });
 app.get('/suggest', async (req, res) => {
     const { term } = req.query;
-    console.log(term)
+    
+    if (!term || term.trim() === '') {
+        return res.status(400).json({
+            message: "Please enter a search term"
+        });
+    }
+    
     // Split search term into individual words
     const searchTerms = term.trim().split(/\s+/);
-    console.log(searchTerms)
-    if(searchTerms.length === 0){
-        res.status(400).json({
-            message: "Please enter a search term"
-        })
-    }
-    if(searchTerms.length == 1){
-        const patterns = searchTerms[0]
-        console.log(patterns)
-        try {
-            const result = await pool.query(
-                `SELECT DISTINCT institute 
-                 FROM public.combined_josaa_in
-                 WHERE institute ILIKE '%${patterns}%'
-                 ORDER BY institute ASC`
-            );   
-            res.json(result.rows.map(r => r.institute));
-        } catch (error) {
-            console.error("Autocomplete error:", error);
-            res.status(500).json([]);
+    
+    try {
+        let query, params;
+        
+        if (searchTerms.length === 1) {
+            query = `
+                SELECT DISTINCT institute 
+                FROM public.combined_josaa_in
+                WHERE institute ILIKE $1
+                ORDER BY institute ASC
+                LIMIT 10
+            `;
+            params = [`%${searchTerms[0]}%`];
+        } else {
+            query = `
+                SELECT DISTINCT institute 
+                FROM public.combined_josaa_in
+                WHERE institute ILIKE $1
+                ORDER BY institute ASC
+                LIMIT 10
+            `;
+            params = [`%${searchTerms[1]}%`];
         }
-    }
-    else{
-        const patterns = searchTerms[1];
-        try {
-            const result = await pool.query(
-                `SELECT DISTINCT institute 
-                 FROM public.combined_josaa_in
-                 WHERE institute ILIKE '%${patterns}%'
-                 ORDER BY institute ASC`
-            ); 
-            res.json(result.rows.map(r => r.institute));
-        } catch (error) {
-            console.error("Autocomplete error:", error);
-            res.status(500).json([]);
-        } 
+        
+        const result = await pool.query(query, params);
+        res.json(result.rows.map(r => r.institute));
+    } catch (error) {
+        console.error("Autocomplete error:", error);
+        res.status(500).json({
+            message: "Error fetching suggestions",
+            error: error.message
+        });
     }
 });
 app.listen(3000, () => {
