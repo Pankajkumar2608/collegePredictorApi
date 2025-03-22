@@ -358,24 +358,34 @@ app.post('/rank-trends', async (req, res) => {
 app.post('/predict-probability', async (req, res) => {
     const { userRank, institute, program, SeatType, quota, gender } = req.body;
     
-    if (!userRank || isNaN(Number(userRank))) {
+    // Validate required parameters
+    if (!userRank || isNaN(Number(userRank)) || Number(userRank) <= 0) {
         return res.status(400).json({
             success: false,
-            message: "Valid user rank is required"
+            message: "Valid positive user rank is required"
         });
     }
     
     const cacheKey = `predict-probability:${JSON.stringify(req.body)}`;
     
     try {
+        // Check cache first
         if (redisClient.isReady) {
-            const cachedData = await redisClient.get(cacheKey);
-            if (cachedData) {
-                return res.status(200).json(JSON.parse(cachedData));
+            try {
+                const cachedData = await redisClient.get(cacheKey);
+                if (cachedData) {
+                    return res.status(200).json(JSON.parse(cachedData));
+                }
+            } catch (cacheError) {
+                console.warn("Cache retrieval failed:", cacheError.message);
+                // Continue execution even if cache fails
             }
         }
         
-        // Get last 3 years of data for this program/institute with proper casts
+        // Build query with parameterized values
+        const queryParams = [];
+        let paramIndex = 1;
+        
         let query = `
             SELECT "Year", 
                    NULLIF("Opening Rank", '')::INTEGER AS "Opening Rank", 
@@ -383,97 +393,110 @@ app.post('/predict-probability', async (req, res) => {
             FROM public.combined_josaa_in
             WHERE 1=1
         `;
-        const params = [];
-        let paramIndex = 1;
         
-        if (institute) {
-            query += ` AND "Institute" = $${paramIndex}`;
-            params.push(institute);
-            paramIndex++;
-        }
+        // Add filters only if they have values
+        const filters = [
+            { field: "Institute", value: institute },
+            { field: "Academic Program Name", value: program },
+            { field: "Seat Type", value: SeatType },
+            { field: "Quota", value: quota },
+            { field: "Gender", value: gender }
+        ];
         
-        if (program) {
-            query += ` AND "Academic Program Name" = $${paramIndex}`;
-            params.push(program);
-            paramIndex++;
-        }
+        filters.forEach(filter => {
+            if (filter.value) {
+                query += ` AND "${filter.field}" = $${paramIndex}`;
+                queryParams.push(filter.value);
+                paramIndex++;
+            }
+        });
         
-        if (SeatType) {
-            query += ` AND "Seat Type" = $${paramIndex}`;
-            params.push(SeatType);
-            paramIndex++;
-        }
+        // Get last 5 years of data instead of 3 for better statistical significance
+        query += ` ORDER BY "Year" DESC LIMIT 5`;
         
-        if (quota) {
-            query += ` AND "Quota" = $${paramIndex}`;
-            params.push(quota);
-            paramIndex++;
-        }
-        
-        if (gender) {
-            query += ` AND "Gender" = $${paramIndex}`;
-            params.push(gender);
-            paramIndex++;
-        }
-        
-        query += ` ORDER BY "Year" DESC LIMIT 3`;
-        
-        const result = await pool.query(query, params);
+        const result = await pool.query(query, queryParams);
         
         if (result.rows.length === 0) {
             const responseData = {
                 success: true,
                 message: "No historical data found for probability estimation",
                 probability: 0,
+                confidence: "low",
                 historicalData: []
             };
             
-            if (redisClient.isReady) {
-                await redisClient.set(cacheKey, JSON.stringify(responseData), { EX: 3600 });
-            }
-            
+            cacheResponse(cacheKey, responseData);
             return res.status(200).json(responseData);
         }
         
-        let probability = 0;
+        // Improved probability calculation
         const rankNum = Number(userRank);
+        const probabilities = [];
+        const yearsData = [];
         
-        // Simple probability estimation algorithm using historical data
         result.rows.forEach(row => {
             const openRank = Number(row["Opening Rank"]);
             const closeRank = Number(row["Closing Rank"]);
+            let rowProbability = 0;
             
-            if (rankNum <= closeRank) {
-                if (rankNum <= openRank) {
-                    probability += 0.95;
+            if (!isNaN(openRank) && !isNaN(closeRank) && openRank > 0 && closeRank > 0) {
+                if (rankNum <= closeRank) {
+                    if (rankNum <= openRank) {
+                        // Rank better than opening rank (high probability)
+                        rowProbability = 0.95;
+                    } else {
+                        // Rank between opening and closing (scaled probability)
+                        const position = (rankNum - openRank) / (closeRank - openRank);
+                        rowProbability = 0.95 - (position * 0.45); // adjusts between 0.95 and 0.5
+                    }
                 } else {
-                    const position = (rankNum - openRank) / (closeRank - openRank);
-                    probability += 0.95 - (position * 0.45); // adjusts between 0.95 and 0.5
+                    // Rank worse than closing rank (low probability with decay)
+                    const difference = rankNum - closeRank;
+                    const threshold = closeRank * 0.2; // Increased from 0.1 to 0.2 for more gradual decay
+                    
+                    if (difference <= threshold) {
+                        rowProbability = 0.3 * (1 - (difference / threshold));
+                    } else {
+                        rowProbability = 0.05;
+                    }
                 }
-            } else {
-                const difference = rankNum - closeRank;
-                const threshold = closeRank * 0.1;
                 
-                if (difference <= threshold) {
-                    probability += 0.3 * (1 - (difference / threshold));
-                } else {
-                    probability += 0.05;
-                }
+                probabilities.push(rowProbability);
+                yearsData.push({
+                    year: row["Year"],
+                    openRank,
+                    closeRank,
+                    probability: rowProbability
+                });
             }
         });
         
-        probability = probability / result.rows.length;
+        // Calculate final probability with weighted average (recent years have more weight)
+        let finalProbability = 0;
+        let weightSum = 0;
+        
+        if (probabilities.length > 0) {
+            probabilities.forEach((prob, index) => {
+                const weight = probabilities.length - index; // More recent years get higher weights
+                finalProbability += prob * weight;
+                weightSum += weight;
+            });
+            
+            finalProbability = finalProbability / weightSum;
+        }
+        
+        // Calculate confidence level based on data availability and consistency
+        const confidence = calculateConfidence(probabilities, yearsData);
         
         const responseData = {
             success: true,
-            probability: Math.min(Math.round(probability * 100) / 100, 0.99),
-            historicalData: result.rows
+            probability: Math.min(Math.round(finalProbability * 100) / 100, 0.99),
+            confidence,
+            historicalData: yearsData,
+            message: getRecommendationMessage(finalProbability, confidence)
         };
         
-        if (redisClient.isReady) {
-            await redisClient.set(cacheKey, JSON.stringify(responseData), { EX: 3600 });
-        }
-        
+        cacheResponse(cacheKey, responseData);
         res.status(200).json(responseData);
     } catch (error) {
         console.error("Probability estimation error:", error);
@@ -485,6 +508,78 @@ app.post('/predict-probability', async (req, res) => {
     }
 });
 
+// Helper function to cache response
+function cacheResponse(key, data) {
+    if (redisClient.isReady) {
+        try {
+            redisClient.set(key, JSON.stringify(data), { EX: 3600 })
+                .catch(err => console.warn("Cache storage failed:", err.message));
+        } catch (err) {
+            console.warn("Cache attempt failed:", err.message);
+        }
+    }
+}
+
+// Calculate confidence level based on data consistency
+function calculateConfidence(probabilities, yearsData) {
+    if (probabilities.length === 0) return "none";
+    if (probabilities.length === 1) return "low";
+    
+    // Check for consistency in data
+    const variance = calculateVariance(probabilities);
+    
+    // Check trend stability
+    const isClosingRankStable = isStable(yearsData.map(d => d.closeRank));
+    
+    if (probabilities.length >= 4 && variance < 0.05 && isClosingRankStable) {
+        return "high";
+    } else if (probabilities.length >= 3 && variance < 0.1) {
+        return "medium";
+    } else {
+        return "low";
+    }
+}
+
+// Calculate statistical variance
+function calculateVariance(values) {
+    if (values.length <= 1) return 0;
+    
+    const mean = values.reduce((sum, val) => sum + val, 0) / values.length;
+    const squaredDiffs = values.map(val => Math.pow(val - mean, 2));
+    return squaredDiffs.reduce((sum, val) => sum + val, 0) / values.length;
+}
+
+// Check if a trend is stable
+function isStable(values) {
+    if (values.length <= 2) return true;
+    
+    // Calculate percentage changes
+    const changes = [];
+    for (let i = 1; i < values.length; i++) {
+        if (values[i-1] === 0) continue;
+        changes.push(Math.abs((values[i] - values[i-1]) / values[i-1]));
+    }
+    
+    // If average change is less than 15%, consider stable
+    return changes.reduce((sum, val) => sum + val, 0) / changes.length < 0.15;
+}
+
+// Get recommendation message based on probability
+function getRecommendationMessage(probability, confidence) {
+    if (confidence === "none" || confidence === "low") {
+        return "Limited historical data available. Consider this as a rough estimate.";
+    }
+    
+    if (probability >= 0.85) {
+        return "High probability of admission. This choice appears to be safe based on historical trends.";
+    } else if (probability >= 0.60) {
+        return "Good probability of admission. This appears to be a reasonable choice based on historical data.";
+    } else if (probability >= 0.30) {
+        return "Moderate probability. Consider this as a competitive option.";
+    } else {
+        return "Low probability based on historical data. Consider this as an ambitious choice.";
+    }
+}
 // Filter options endpoint
 app.get('/filter-options', async (req, res) => {
     const cacheKey = 'filter-options';
