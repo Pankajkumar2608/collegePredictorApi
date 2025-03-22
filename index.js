@@ -118,7 +118,7 @@ app.post('/filter', async (req, res) => {
             paramIndex++;
         }
         if (quota) {
-            filterQuery += ` AND "quota" = $${paramIndex}`;
+            filterQuery += ` AND "Quota" = $${paramIndex}`;
             params.push(quota);
             paramIndex++;
         }
