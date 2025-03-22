@@ -3,7 +3,7 @@ import cors from 'cors';
 import pkg from 'pg';
 const { Pool } = pkg;
 import dotenv from 'dotenv';
-import { createClient } from 'redis'; // You'll need to install: npm install redis
+import { createClient } from 'redis';
 
 dotenv.config();
 
@@ -19,7 +19,7 @@ const redisClient = createClient({
     url: process.env.REDIS_URL || 'redis://localhost:6379'
 });
 
-redisClient.on('error', (err) => console.log('Redis Client Error', err));
+redisClient.on('error', (err) => console.error('Redis Client Error', err));
 
 (async () => {
     try {
@@ -30,6 +30,7 @@ redisClient.on('error', (err) => console.log('Redis Client Error', err));
     }
 })();
 
+// Initialize PostgreSQL Pool
 const pool = new Pool({
     user: process.env.PGUSER,
     host: process.env.PGHOST,
@@ -59,7 +60,7 @@ app.get('/health', async (req, res) => {
     }
 });
 
-// Main filter endpoint with caching
+// Filter endpoint
 app.post('/filter', async (req, res) => {
     const { 
         institute, 
@@ -69,10 +70,9 @@ app.post('/filter', async (req, res) => {
         gender, 
         userRank,
         Year,
-        round,
+        round
     } = req.body;
 
-    // Input validation
     if (userRank && isNaN(Number(userRank))) {
         return res.status(400).json({
             success: false,
@@ -80,11 +80,9 @@ app.post('/filter', async (req, res) => {
         });
     }
 
-    // Create cache key from request parameters
     const cacheKey = `filter:${JSON.stringify(req.body)}`;
-    
+
     try {
-        // Try to get data from cache first
         if (redisClient.isReady) {
             const cachedData = await redisClient.get(cacheKey);
             if (cachedData) {
@@ -93,15 +91,14 @@ app.post('/filter', async (req, res) => {
             }
         }
 
-        // Build the query
         let filterQuery = `
-            SELECT *, ABS("Opening Rank" - $1) AS rank_diff 
-            FROM public.combined_josaa_in 
+            SELECT *, ABS(NULLIF("Opening Rank", '')::INTEGER - $1) AS rank_diff
+            FROM public.combined_josaa_in
             WHERE 1=1
         `;
-        const params = [userRank || 0]; // Default to 0 if no rank provided
+        const params = [userRank ? parseInt(userRank) : 0];
         let paramIndex = 2;
-        
+
         if (institute) {
             filterQuery += ` AND "Institute" ILIKE $${paramIndex}`;
             params.push(`%${institute}%`);
@@ -137,62 +134,56 @@ app.post('/filter', async (req, res) => {
             params.push(round);
             paramIndex++;
         }
-        
-        // Add rank filtering if provided
+
         if (userRank) {
-            filterQuery += ` AND "Opening Rank" <= $${paramIndex} AND "Closing Rank" >= $${paramIndex}`;
+            filterQuery += ` AND NULLIF("Opening Rank", '')::INTEGER <= $${paramIndex} 
+                             AND NULLIF("Closing Rank", '')::INTEGER >= $${paramIndex}`;
             params.push(userRank);
             paramIndex++;
             filterQuery += ` ORDER BY rank_diff ASC `;
         } else {
-            filterQuery += ` ORDER BY "Opening Rank" ASC `;
+            filterQuery += ` ORDER BY NULLIF("Opening Rank", '')::INTEGER ASC `;
         }
-        
-        // Add limit for better performance
+
         filterQuery += ` LIMIT 50`;
-        
+
         const result = await pool.query(filterQuery, params);
-        
-        // Prepare response
         const responseData = {
             success: true,
             count: result.rows.length,
             message: result.rows.length === 0 ? "No matches found for the given criteria" : null,
             filterData: result.rows
         };
-        
-        // Cache the result if Redis is connected
+
         if (redisClient.isReady) {
-            await redisClient.set(cacheKey, JSON.stringify(responseData), { EX: 3600 }); // Cache for 1 hour
+            await redisClient.set(cacheKey, JSON.stringify(responseData), { EX: 3600 });
         }
-        
+
         res.status(200).json(responseData);
     } catch (error) {
         console.error("Filter error:", error);
         res.status(500).json({
             success: false,
-            message: "Error in fetching data",
+            message: "Error fetching data",
             error: error.message
         });
     }
 });
 
-// Institute suggestion endpoint (fixed SQL injection vulnerability)
+// Institute suggestion endpoint
 app.get('/suggest', async (req, res) => {
     const { term } = req.query;
-    
+
     if (!term || term.trim() === '') {
         return res.status(400).json({
             success: false,
             message: "Please enter a search term"
         });
     }
-    
-    // Create cache key
+
     const cacheKey = `suggest:${term}`;
-    
+
     try {
-        // Try to get from cache
         if (redisClient.isReady) {
             const cachedData = await redisClient.get(cacheKey);
             if (cachedData) {
@@ -200,40 +191,21 @@ app.get('/suggest', async (req, res) => {
                 return res.json(JSON.parse(cachedData));
             }
         }
-        
-        // Split search term into individual words
-        const searchTerms = term.trim().split(/\s+/);
-        
-        let query, params;
-        
-        if (searchTerms.length === 1) {
-            query = `
-                SELECT DISTINCT institute 
-                FROM public.combined_josaa_in
-                WHERE institute ILIKE $1
-                ORDER BY institute ASC
-                LIMIT 10
-            `;
-            params = [`%${searchTerms[0]}%`];
-        } else {
-            query = `
-                SELECT DISTINCT institute 
-                FROM public.combined_josaa_in
-                WHERE institute ILIKE $1
-                ORDER BY institute ASC
-                LIMIT 10
-            `;
-            params = [`%${searchTerms[1]}%`];
-        }
-        
-        const result = await pool.query(query, params);
-        const suggestions = result.rows.map(r => r.institute);
-        
-        // Cache the result
+
+        const query = `
+            SELECT DISTINCT "Institute"
+            FROM public.combined_josaa_in
+            WHERE "Institute" ILIKE $1
+            ORDER BY "Institute" ASC
+            LIMIT 10
+        `;
+        const result = await pool.query(query, [`%${term}%`]);
+        const suggestions = result.rows.map(r => r.Institute);
+
         if (redisClient.isReady) {
-            await redisClient.set(cacheKey, JSON.stringify(suggestions), { EX: 1800 }); // Cache for 30 minutes
+            await redisClient.set(cacheKey, JSON.stringify(suggestions), { EX: 1800 });
         }
-        
+
         res.json(suggestions);
     } catch (error) {
         console.error("Autocomplete error:", error);
@@ -245,7 +217,7 @@ app.get('/suggest', async (req, res) => {
     }
 });
 
-// New endpoint: Program suggestion
+// Program suggestion endpoint
 app.get('/suggest-programs', async (req, res) => {
     const { term } = req.query;
     
@@ -259,7 +231,6 @@ app.get('/suggest-programs', async (req, res) => {
     const cacheKey = `suggest-programs:${term}`;
     
     try {
-        // Try to get from cache
         if (redisClient.isReady) {
             const cachedData = await redisClient.get(cacheKey);
             if (cachedData) {
@@ -277,9 +248,8 @@ app.get('/suggest-programs', async (req, res) => {
         const result = await pool.query(query, [`%${term}%`]);
         const programs = result.rows.map(r => r.program);
         
-        // Cache the result
         if (redisClient.isReady) {
-            await redisClient.set(cacheKey, JSON.stringify(programs), { EX: 1800 }); // Cache for 30 minutes
+            await redisClient.set(cacheKey, JSON.stringify(programs), { EX: 1800 });
         }
         
         res.json(programs);
@@ -293,9 +263,9 @@ app.get('/suggest-programs', async (req, res) => {
     }
 });
 
-// New endpoint: Rank trends
+// Rank trends endpoint
 app.post('/rank-trends', async (req, res) => {
-    const { institute, program, seatType, quota, gender } = req.body;
+    const { institute, program, SeatType, quota, gender } = req.body;
     
     if (!institute && !program) {
         return res.status(400).json({
@@ -307,7 +277,6 @@ app.post('/rank-trends', async (req, res) => {
     const cacheKey = `rank-trends:${JSON.stringify(req.body)}`;
     
     try {
-        // Try to get from cache
         if (redisClient.isReady) {
             const cachedData = await redisClient.get(cacheKey);
             if (cachedData) {
@@ -316,7 +285,9 @@ app.post('/rank-trends', async (req, res) => {
         }
         
         let query = `
-            SELECT "Year", "round", "Opening Rank", "Closing Rank"
+            SELECT "Year", "Round", 
+                   NULLIF("Opening Rank", '')::INTEGER AS "Opening Rank", 
+                   NULLIF("Closing Rank", '')::INTEGER AS "Closing Rank"
             FROM public.combined_josaa_in
             WHERE 1=1
         `;
@@ -324,7 +295,7 @@ app.post('/rank-trends', async (req, res) => {
         let paramIndex = 1;
         
         if (institute) {
-            query += ` AND "institute" = $${paramIndex}`;
+            query += ` AND "Institute" = $${paramIndex}`;
             params.push(institute);
             paramIndex++;
         }
@@ -335,25 +306,25 @@ app.post('/rank-trends', async (req, res) => {
             paramIndex++;
         }
         
-        if (seatType) {
+        if (SeatType) {
             query += ` AND "Seat Type" = $${paramIndex}`;
-            params.push(seatType);
+            params.push(SeatType);
             paramIndex++;
         }
         
         if (quota) {
-            query += ` AND "quota" = $${paramIndex}`;
+            query += ` AND "Quota" = $${paramIndex}`;
             params.push(quota);
             paramIndex++;
         }
         
         if (gender) {
-            query += ` AND "gender" = $${paramIndex}`;
+            query += ` AND "Gender" = $${paramIndex}`;
             params.push(gender);
             paramIndex++;
         }
         
-        query += ` ORDER BY "Year" ASC, "round" ASC`;
+        query += ` ORDER BY "Year" ASC, "Round" ASC`;
         
         const result = await pool.query(query, params);
         
@@ -363,9 +334,8 @@ app.post('/rank-trends', async (req, res) => {
             data: result.rows
         };
         
-        // Cache the result
         if (redisClient.isReady) {
-            await redisClient.set(cacheKey, JSON.stringify(responseData), { EX: 3600 }); // Cache for 1 hour
+            await redisClient.set(cacheKey, JSON.stringify(responseData), { EX: 3600 });
         }
         
         res.status(200).json(responseData);
@@ -379,9 +349,9 @@ app.post('/rank-trends', async (req, res) => {
     }
 });
 
-// New endpoint: Probability prediction
+// Probability prediction endpoint
 app.post('/predict-probability', async (req, res) => {
-    const { userRank, institute, program, seatType, quota, gender } = req.body;
+    const { userRank, institute, program, SeatType, quota, gender } = req.body;
     
     if (!userRank || isNaN(Number(userRank))) {
         return res.status(400).json({
@@ -393,7 +363,6 @@ app.post('/predict-probability', async (req, res) => {
     const cacheKey = `predict-probability:${JSON.stringify(req.body)}`;
     
     try {
-        // Try to get from cache
         if (redisClient.isReady) {
             const cachedData = await redisClient.get(cacheKey);
             if (cachedData) {
@@ -401,9 +370,11 @@ app.post('/predict-probability', async (req, res) => {
             }
         }
         
-        // Get last 3 years of data for this program/institute
+        // Get last 3 years of data for this program/institute with proper casts
         let query = `
-            SELECT "Year", "Opening Rank", "Closing Rank"
+            SELECT "Year", 
+                   NULLIF("Opening Rank", '')::INTEGER AS "Opening Rank", 
+                   NULLIF("Closing Rank", '')::INTEGER AS "Closing Rank"
             FROM public.combined_josaa_in
             WHERE 1=1
         `;
@@ -411,7 +382,7 @@ app.post('/predict-probability', async (req, res) => {
         let paramIndex = 1;
         
         if (institute) {
-            query += ` AND "institute" = $${paramIndex}`;
+            query += ` AND "Institute" = $${paramIndex}`;
             params.push(institute);
             paramIndex++;
         }
@@ -422,20 +393,20 @@ app.post('/predict-probability', async (req, res) => {
             paramIndex++;
         }
         
-        if (seatType) {
+        if (SeatType) {
             query += ` AND "Seat Type" = $${paramIndex}`;
-            params.push(seatType);
+            params.push(SeatType);
             paramIndex++;
         }
         
         if (quota) {
-            query += ` AND "quota" = $${paramIndex}`;
+            query += ` AND "Quota" = $${paramIndex}`;
             params.push(quota);
             paramIndex++;
         }
         
         if (gender) {
-            query += ` AND "gender" = $${paramIndex}`;
+            query += ` AND "Gender" = $${paramIndex}`;
             params.push(gender);
             paramIndex++;
         }
@@ -459,41 +430,33 @@ app.post('/predict-probability', async (req, res) => {
             return res.status(200).json(responseData);
         }
         
-        // Calculate probability based on historical data
         let probability = 0;
         const rankNum = Number(userRank);
         
-        // Simple algorithm - can be improved
+        // Simple probability estimation algorithm using historical data
         result.rows.forEach(row => {
             const openRank = Number(row["Opening Rank"]);
             const closeRank = Number(row["Closing Rank"]);
             
             if (rankNum <= closeRank) {
-                // User's rank is within the closing rank - high chance
                 if (rankNum <= openRank) {
-                    // User's rank is better than opening rank - very high chance
                     probability += 0.95;
                 } else {
-                    // User's rank is between opening and closing - good chance
                     const position = (rankNum - openRank) / (closeRank - openRank);
-                    probability += 0.95 - (position * 0.45); // 0.95 to 0.5 range
+                    probability += 0.95 - (position * 0.45); // adjusts between 0.95 and 0.5
                 }
             } else {
-                // User's rank is outside closing rank
                 const difference = rankNum - closeRank;
-                const threshold = closeRank * 0.1; // 10% buffer
+                const threshold = closeRank * 0.1;
                 
                 if (difference <= threshold) {
-                    // Within threshold - small chance
                     probability += 0.3 * (1 - (difference / threshold));
                 } else {
-                    // Outside threshold - very little chance
                     probability += 0.05;
                 }
             }
         });
         
-        // Average the probability
         probability = probability / result.rows.length;
         
         const responseData = {
@@ -502,9 +465,8 @@ app.post('/predict-probability', async (req, res) => {
             historicalData: result.rows
         };
         
-        // Cache the result
         if (redisClient.isReady) {
-            await redisClient.set(cacheKey, JSON.stringify(responseData), { EX: 3600 }); // Cache for 1 hour
+            await redisClient.set(cacheKey, JSON.stringify(responseData), { EX: 3600 });
         }
         
         res.status(200).json(responseData);
@@ -518,12 +480,11 @@ app.post('/predict-probability', async (req, res) => {
     }
 });
 
-// New endpoint: Get filter options
+// Filter options endpoint
 app.get('/filter-options', async (req, res) => {
     const cacheKey = 'filter-options';
     
     try {
-        // Try to get from cache
         if (redisClient.isReady) {
             const cachedData = await redisClient.get(cacheKey);
             if (cachedData) {
@@ -531,42 +492,33 @@ app.get('/filter-options', async (req, res) => {
             }
         }
         
-        // Get years
+        // Get distinct values for filter options
         const yearsResult = await pool.query(
             'SELECT DISTINCT "Year" FROM public.combined_josaa_in ORDER BY "Year" DESC'
         );
-        
-        // Get quotas
         const quotasResult = await pool.query(
-            'SELECT DISTINCT "quota" FROM public.combined_josaa_in ORDER BY "quota" ASC'
+            'SELECT DISTINCT "Quota" FROM public.combined_josaa_in ORDER BY "Quota" ASC'
         );
-        
-        // Get seat types
         const seatTypesResult = await pool.query(
             'SELECT DISTINCT "Seat Type" FROM public.combined_josaa_in ORDER BY "Seat Type" ASC'
         );
-        
-        // Get genders
         const gendersResult = await pool.query(
-            'SELECT DISTINCT "gender" FROM public.combined_josaa_in ORDER BY "gender" ASC'
+            'SELECT DISTINCT "Gender" FROM public.combined_josaa_in ORDER BY "Gender" ASC'
         );
-        
-        // Get rounds
         const roundsResult = await pool.query(
-            'SELECT DISTINCT "round" FROM public.combined_josaa_in ORDER BY "round" ASC'
+            'SELECT DISTINCT "Round" FROM public.combined_josaa_in ORDER BY "Round" ASC'
         );
         
         const options = {
             years: yearsResult.rows.map(row => row.Year),
-            quotas: quotasResult.rows.map(row => row.quota),
+            quotas: quotasResult.rows.map(row => row.Quota),
             seatTypes: seatTypesResult.rows.map(row => row["Seat Type"]),
-            genders: gendersResult.rows.map(row => row.gender),
-            rounds: roundsResult.rows.map(row => row.round)
+            genders: gendersResult.rows.map(row => row.Gender),
+            rounds: roundsResult.rows.map(row => row.Round)
         };
         
-        // Cache the result (longer duration as this rarely changes)
         if (redisClient.isReady) {
-            await redisClient.set(cacheKey, JSON.stringify(options), { EX: 86400 }); // Cache for 24 hours
+            await redisClient.set(cacheKey, JSON.stringify(options), { EX: 86400 });
         }
         
         res.status(200).json(options);
