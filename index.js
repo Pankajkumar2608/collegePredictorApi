@@ -80,7 +80,7 @@ app.post('/filter', async (req, res) => {
             success: false,
             message: "User rank must be a valid integer number"
         });
-    }
+    }};
     
     // Now safe to convert to integer
     const userRankInt = parseInt(userRank, 10);
