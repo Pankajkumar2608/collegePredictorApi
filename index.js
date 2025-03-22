@@ -103,7 +103,7 @@ app.post('/filter', async (req, res) => {
         let paramIndex = 2;
         
         if (institute) {
-            filterQuery += ` AND "institute" ILIKE $${paramIndex}`;
+            filterQuery += ` AND "Institute" ILIKE $${paramIndex}`;
             params.push(`%${institute}%`);
             paramIndex++;
         }
@@ -128,12 +128,12 @@ app.post('/filter', async (req, res) => {
             paramIndex++;
         }
         if (gender) {
-            filterQuery += ` AND "gender" = $${paramIndex}`;
+            filterQuery += ` AND "Gender" = $${paramIndex}`;
             params.push(gender);
             paramIndex++;
         }
         if (round) {
-            filterQuery += ` AND "round" = $${paramIndex}`;
+            filterQuery += ` AND "Round" = $${paramIndex}`;
             params.push(round);
             paramIndex++;
         }
