@@ -73,12 +73,17 @@ app.post('/filter', async (req, res) => {
         round
     } = req.body;
 
-    if (userRank && isNaN(Number(userRank))) {
+    if (userRank) {
+    // More strict validation to ensure it's only digits
+    if (!/^\d+$/.test(userRank)) {
         return res.status(400).json({
             success: false,
-            message: "User rank must be a number"
+            message: "User rank must be a valid integer number"
         });
     }
+    
+    // Now safe to convert to integer
+    const userRankInt = parseInt(userRank, 10);
 
     const cacheKey = `filter:${JSON.stringify(req.body)}`;
 
