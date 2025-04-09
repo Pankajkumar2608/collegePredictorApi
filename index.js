@@ -443,19 +443,19 @@ app.post('/predict-probability', async (req, res) => {
                 if (rankNum <= closeRank) {
                     if (rankNum <= openRank) {
                         // Rank better than opening rank (high probability)
-                        rowProbability = 0.95;
+                        rowProbability = 0.99;
                     } else {
                         // Rank between opening and closing (scaled probability)
                         const position = (rankNum - openRank) / (closeRank - openRank);
-                        rowProbability = 0.95 - (position * 0.45); // adjusts between 0.95 and 0.5
+                        rowProbability = 0.95 - (position * 0.65); // adjusts between 0.95 and 0.5
                     }
                 } else {
                     // Rank worse than closing rank (low probability with decay)
                     const difference = rankNum - closeRank;
-                    const threshold = closeRank * 0.2; // Increased from 0.1 to 0.2 for more gradual decay
+                    const threshold = closeRank * 0.1; // Increased from 0.1 to 0.2 for more gradual decay
                     
                     if (difference <= threshold) {
-                        rowProbability = 0.3 * (1 - (difference / threshold));
+                        rowProbability = 0.2 * (1 - (difference / threshold));
                     } else {
                         rowProbability = 0.05;
                     }
