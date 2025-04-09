@@ -411,7 +411,7 @@ app.post('/predict-probability', async (req, res) => {
             }
         });
         
-        // Get last 5 years of data instead of 3 for better statistical significance
+        // Get last 5 years of data for better statistical significance
         query += ` ORDER BY "Year" DESC LIMIT 5`;
         
         const result = await pool.query(query, queryParams);
@@ -433,6 +433,7 @@ app.post('/predict-probability', async (req, res) => {
         const rankNum = Number(userRank);
         const probabilities = [];
         const yearsData = [];
+        const currentYear = new Date().getFullYear();
         
         result.rows.forEach(row => {
             const openRank = Number(row["Opening Rank"]);
@@ -445,44 +446,63 @@ app.post('/predict-probability', async (req, res) => {
                         // Rank better than opening rank (high probability)
                         rowProbability = 0.99;
                     } else {
-                        // Rank between opening and closing (scaled probability)
+                        // Rank between opening and closing (more aggressive scaling)
                         const position = (rankNum - openRank) / (closeRank - openRank);
-                        rowProbability = 0.95 - (position * 0.65); // adjusts between 0.95 and 0.5
+                        // More steep decline as you approach closing rank
+                        rowProbability = 0.95 - (Math.pow(position, 0.8) * 0.75);
                     }
                 } else {
-                    // Rank worse than closing rank (low probability with decay)
+                    // Rank worse than closing rank (more rapid decay)
                     const difference = rankNum - closeRank;
-                    const threshold = closeRank * 0.1; // Increased from 0.1 to 0.2 for more gradual decay
+                    const threshold = closeRank * 0.05; // Reduced threshold for stricter cutoff
                     
                     if (difference <= threshold) {
-                        rowProbability = 0.2 * (1 - (difference / threshold));
+                        // Exponential decay instead of linear
+                        rowProbability = 0.15 * Math.exp(-3 * (difference / threshold));
                     } else {
-                        rowProbability = 0.05;
+                        rowProbability = 0.01; // Even lower base probability for ranks well beyond closing
                     }
                 }
+                
+                // Apply recency bias - more recent years should have even more weight
+                const recencyFactor = row["Year"] === currentYear - 1 ? 1.5 : 1;
+                rowProbability *= recencyFactor;
                 
                 probabilities.push(rowProbability);
                 yearsData.push({
                     year: row["Year"],
                     openRank,
                     closeRank,
-                    probability: rowProbability
+                    probability: Math.min(rowProbability, 0.99) // Cap at 0.99
                 });
             }
         });
         
-        // Calculate final probability with weighted average (recent years have more weight)
+        // Calculate final probability with enhanced weighted average
         let finalProbability = 0;
         let weightSum = 0;
         
         if (probabilities.length > 0) {
             probabilities.forEach((prob, index) => {
-                const weight = probabilities.length - index; // More recent years get higher weights
+                // Exponential weighting for recent years
+                const weight = Math.pow(1.5, probabilities.length - index - 1);
                 finalProbability += prob * weight;
                 weightSum += weight;
             });
             
             finalProbability = finalProbability / weightSum;
+            
+            // Add pessimistic correction for borderline cases
+            // If the rank is close to the most recent year's closing rank
+            if (yearsData.length > 0) {
+                const mostRecentYear = yearsData[0];
+                if (rankNum > mostRecentYear.closeRank * 0.95) {
+                    // Apply correction factor for ranks near the threshold
+                    const correction = Math.min(1, (rankNum - mostRecentYear.closeRank * 0.95) / 
+                                               (mostRecentYear.closeRank * 0.05));
+                    finalProbability *= (1 - correction * 0.3);
+                }
+            }
         }
         
         // Calculate confidence level based on data availability and consistency
@@ -507,6 +527,75 @@ app.post('/predict-probability', async (req, res) => {
         });
     }
 });
+
+// Helper function to cache response
+function cacheResponse(key, data) {
+    if (redisClient.isReady) {
+        try {
+            // Cache for 24 hours (86400 seconds)
+            redisClient.set(key, JSON.stringify(data), {
+                EX: 86400
+            }).catch(err => {
+                console.warn("Redis cache set error:", err.message);
+            });
+        } catch (e) {
+            console.warn("Redis cache operation failed:", e.message);
+        }
+    }
+}
+
+// Helper function to calculate confidence level
+function calculateConfidence(probabilities, yearsData) {
+    if (probabilities.length === 0) return "low";
+    
+    // More data points = higher confidence
+    if (probabilities.length >= 4) {
+        // Check consistency in trend
+        const stdDev = calculateStandardDeviation(probabilities);
+        
+        if (stdDev < 0.15) return "very high";
+        if (stdDev < 0.25) return "high";
+        return "medium";
+    } else if (probabilities.length >= 2) {
+        // Check consistency in recent years
+        const stdDev = calculateStandardDeviation(probabilities);
+        
+        if (stdDev < 0.2) return "medium";
+        return "low";
+    }
+    
+    // Only one data point - check recency
+    if (yearsData.length > 0 && yearsData[0].year >= new Date().getFullYear() - 2) {
+        return "low";
+    }
+    
+    return "very low";
+}
+
+// Helper function to calculate standard deviation
+function calculateStandardDeviation(values) {
+    const avg = values.reduce((sum, val) => sum + val, 0) / values.length;
+    const squareDiffs = values.map(value => Math.pow(value - avg, 2));
+    const avgSquareDiff = squareDiffs.reduce((sum, val) => sum + val, 0) / squareDiffs.length;
+    return Math.sqrt(avgSquareDiff);
+}
+
+// Helper function to generate recommendation message
+function getRecommendationMessage(probability, confidence) {
+    if (probability >= 0.9) {
+        return "You have an excellent chance of getting this seat based on historical data.";
+    } else if (probability >= 0.7) {
+        return "You have a good chance of getting this seat based on historical data.";
+    } else if (probability >= 0.5) {
+        return "You have a reasonable chance of getting this seat, but consider backup options.";
+    } else if (probability >= 0.3) {
+        return "Your chances are somewhat low. Consider this as a stretch option and have safer backups.";
+    } else if (probability >= 0.1) {
+        return "Your chances are quite low based on historical data. Consider other options.";
+    } else {
+        return "Historical data suggests very low probability. Consider exploring other programs or institutes.";
+    }
+}
 
 // Helper function to cache response
 function cacheResponse(key, data) {
