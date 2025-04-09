@@ -40,6 +40,113 @@ const pool = new Pool({
     ssl: true,
 });
 
+// Helper function to cache response with better error handling
+async function cacheResponse(key, data, expirationSeconds = 3600) {
+    if (!redisClient.isReady) return;
+    
+    try {
+        await redisClient.set(key, JSON.stringify(data), { EX: expirationSeconds })
+            .catch(err => console.warn(`Cache storage failed for key ${key}:`, err.message));
+    } catch (err) {
+        console.warn(`Cache attempt failed for key ${key}:`, err.message);
+    }
+}
+
+// Helper function to retrieve from cache with better error handling
+async function getFromCache(key) {
+    if (!redisClient.isReady) return null;
+    
+    try {
+        return JSON.parse(await redisClient.get(key));
+    } catch (err) {
+        console.warn(`Cache retrieval failed for key ${key}:`, err.message);
+        return null;
+    }
+}
+
+// Helper function to calculate standard deviation
+function calculateStandardDeviation(values) {
+    if (!values || values.length === 0) return 0;
+    
+    const avg = values.reduce((sum, val) => sum + val, 0) / values.length;
+    const squareDiffs = values.map(value => Math.pow(value - avg, 2));
+    const avgSquareDiff = squareDiffs.reduce((sum, val) => sum + val, 0) / squareDiffs.length;
+    return Math.sqrt(avgSquareDiff);
+}
+
+// Check if a trend is stable
+function isStable(values) {
+    if (!values || values.length <= 2) return true;
+    
+    // Calculate percentage changes
+    const changes = [];
+    for (let i = 1; i < values.length; i++) {
+        if (values[i-1] === 0) continue;
+        changes.push(Math.abs((values[i] - values[i-1]) / values[i-1]));
+    }
+    
+    // If average change is less than 15%, consider stable
+    return changes.length === 0 || 
+           changes.reduce((sum, val) => sum + val, 0) / changes.length < 0.15;
+}
+
+// Unified and improved confidence calculation
+function calculateConfidence(probabilities, yearsData) {
+    if (!probabilities || probabilities.length === 0) return "none";
+    if (probabilities.length === 1) return "low";
+    
+    // Calculate standard deviation for consistency check
+    const stdDev = calculateStandardDeviation(probabilities);
+    
+    // Check trend stability in closing ranks
+    const isClosingRankStable = isStable(yearsData.map(d => d.closeRank));
+    
+    if (probabilities.length >= 4 && stdDev < 0.15 && isClosingRankStable) {
+        return "very high";
+    } else if (probabilities.length >= 4 && stdDev < 0.25) {
+        return "high";
+    } else if (probabilities.length >= 3 && stdDev < 0.2) {
+        return "medium";
+    } else if (probabilities.length >= 2) {
+        return "low";
+    }
+    
+    // Only one data point - check recency
+    if (yearsData && yearsData.length > 0 && 
+        yearsData[0].year >= new Date().getFullYear() - 2) {
+        return "low";
+    }
+    
+    return "very low";
+}
+
+// Unified recommendation message generator
+function getRecommendationMessage(probability, confidence) {
+    // Handle low confidence cases first
+    if (confidence === "none" || confidence === "very low") {
+        return "Limited historical data available. Consider this as a rough estimate.";
+    }
+    
+    // Provide graduated recommendations based on probability
+    if (probability >= 0.9) {
+        return "You have an excellent chance of getting this seat based on historical data.";
+    } else if (probability >= 0.75) {
+        return "You have a very good chance of getting this seat based on historical data.";
+    } else if (probability >= 0.6) {
+        return "You have a good chance of getting this seat based on historical data.";
+    } else if (probability >= 0.45) {
+        return "You have a reasonable chance of getting this seat, but consider backup options.";
+    } else if (probability >= 0.3) {
+        return "Your chances are moderate. Consider this as a competitive option with safer backups.";
+    } else if (probability >= 0.15) {
+        return "Your chances are somewhat low. Consider this as a stretch option and have safer backups.";
+    } else if (probability >= 0.05) {
+        return "Your chances are quite low based on historical data. Consider other options.";
+    } else {
+        return "Historical data suggests very low probability. Consider exploring other programs or institutes.";
+    }
+}
+
 // Health check endpoint
 app.get('/health', async (req, res) => {
     try {
@@ -73,35 +180,33 @@ app.post('/filter', async (req, res) => {
         round
     } = req.body;
 
-    if (userRank) {
-    // More strict validation to ensure it's only digits
-    if (!/^\d+$/.test(userRank)) {
+    // Validate user rank - strict pattern match for digits only
+    if (userRank && !/^\d+$/.test(userRank)) {
         return res.status(400).json({
             success: false,
             message: "User rank must be a valid integer number"
         });
-    }};
+    }
     
     // Now safe to convert to integer
-    const userRankInt = parseInt(userRank, 10);
-
+    const userRankInt = userRank ? parseInt(userRank, 10) : 0;
     const cacheKey = `filter:${JSON.stringify(req.body)}`;
 
     try {
-        if (redisClient.isReady) {
-            const cachedData = await redisClient.get(cacheKey);
-            if (cachedData) {
-                console.log('Serving filter results from cache');
-                return res.status(200).json(JSON.parse(cachedData));
-            }
+        // Check cache first
+        const cachedData = await getFromCache(cacheKey);
+        if (cachedData) {
+            console.log('Serving filter results from cache');
+            return res.status(200).json(cachedData);
         }
 
+        // Build parameterized query 
         let filterQuery = `
             SELECT *, ABS(NULLIF("Opening Rank", '')::INTEGER - $1) AS rank_diff
             FROM public.combined_josaa_in
             WHERE 1=1
         `;
-        const params = [userRank ? parseInt(userRank) : 0];
+        const params = [userRankInt];
         let paramIndex = 2;
 
         if (institute) {
@@ -142,8 +247,8 @@ app.post('/filter', async (req, res) => {
 
         if (userRank) {
             filterQuery += ` AND NULLIF("Opening Rank", '')::INTEGER <= $${paramIndex} 
-                             AND NULLIF("Closing Rank", '')::INTEGER >= $${paramIndex}`;
-            params.push(userRank);
+                            AND NULLIF("Closing Rank", '')::INTEGER >= $${paramIndex}`;
+            params.push(userRankInt);
             paramIndex++;
             filterQuery += ` ORDER BY rank_diff ASC `;
         } else {
@@ -160,10 +265,8 @@ app.post('/filter', async (req, res) => {
             filterData: result.rows
         };
 
-        if (redisClient.isReady) {
-            await redisClient.set(cacheKey, JSON.stringify(responseData), { EX: 3600 });
-        }
-
+        // Cache the result
+        await cacheResponse(cacheKey, responseData, 3600);
         res.status(200).json(responseData);
     } catch (error) {
         console.error("Filter error:", error);
@@ -189,12 +292,11 @@ app.get('/suggest', async (req, res) => {
     const cacheKey = `suggest:${term}`;
 
     try {
-        if (redisClient.isReady) {
-            const cachedData = await redisClient.get(cacheKey);
-            if (cachedData) {
-                console.log('Serving suggestions from cache');
-                return res.json(JSON.parse(cachedData));
-            }
+        // Check cache
+        const cachedData = await getFromCache(cacheKey);
+        if (cachedData) {
+            console.log('Serving suggestions from cache');
+            return res.json(cachedData);
         }
 
         const query = `
@@ -207,10 +309,8 @@ app.get('/suggest', async (req, res) => {
         const result = await pool.query(query, [`%${term}%`]);
         const suggestions = result.rows.map(r => r.Institute);
 
-        if (redisClient.isReady) {
-            await redisClient.set(cacheKey, JSON.stringify(suggestions), { EX: 1800 });
-        }
-
+        // Cache the results
+        await cacheResponse(cacheKey, suggestions, 1800);
         res.json(suggestions);
     } catch (error) {
         console.error("Autocomplete error:", error);
@@ -236,11 +336,10 @@ app.get('/suggest-programs', async (req, res) => {
     const cacheKey = `suggest-programs:${term}`;
     
     try {
-        if (redisClient.isReady) {
-            const cachedData = await redisClient.get(cacheKey);
-            if (cachedData) {
-                return res.json(JSON.parse(cachedData));
-            }
+        // Check cache
+        const cachedData = await getFromCache(cacheKey);
+        if (cachedData) {
+            return res.json(cachedData);
         }
         
         const query = `
@@ -253,10 +352,8 @@ app.get('/suggest-programs', async (req, res) => {
         const result = await pool.query(query, [`%${term}%`]);
         const programs = result.rows.map(r => r.program);
         
-        if (redisClient.isReady) {
-            await redisClient.set(cacheKey, JSON.stringify(programs), { EX: 1800 });
-        }
-        
+        // Cache the results
+        await cacheResponse(cacheKey, programs, 1800);
         res.json(programs);
     } catch (error) {
         console.error("Program suggestion error:", error);
@@ -282,11 +379,10 @@ app.post('/rank-trends', async (req, res) => {
     const cacheKey = `rank-trends:${JSON.stringify(req.body)}`;
     
     try {
-        if (redisClient.isReady) {
-            const cachedData = await redisClient.get(cacheKey);
-            if (cachedData) {
-                return res.status(200).json(JSON.parse(cachedData));
-            }
+        // Check cache
+        const cachedData = await getFromCache(cacheKey);
+        if (cachedData) {
+            return res.status(200).json(cachedData);
         }
         
         let query = `
@@ -339,10 +435,8 @@ app.post('/rank-trends', async (req, res) => {
             data: result.rows
         };
         
-        if (redisClient.isReady) {
-            await redisClient.set(cacheKey, JSON.stringify(responseData), { EX: 3600 });
-        }
-        
+        // Cache the results
+        await cacheResponse(cacheKey, responseData, 3600);
         res.status(200).json(responseData);
     } catch (error) {
         console.error("Rank trends error:", error);
@@ -354,7 +448,7 @@ app.post('/rank-trends', async (req, res) => {
     }
 });
 
-// Probability prediction endpoint
+// Improved Probability prediction endpoint
 app.post('/predict-probability', async (req, res) => {
     const { userRank, institute, program, SeatType, quota, gender } = req.body;
     
@@ -370,16 +464,9 @@ app.post('/predict-probability', async (req, res) => {
     
     try {
         // Check cache first
-        if (redisClient.isReady) {
-            try {
-                const cachedData = await redisClient.get(cacheKey);
-                if (cachedData) {
-                    return res.status(200).json(JSON.parse(cachedData));
-                }
-            } catch (cacheError) {
-                console.warn("Cache retrieval failed:", cacheError.message);
-                // Continue execution even if cache fails
-            }
+        const cachedData = await getFromCache(cacheKey);
+        if (cachedData) {
+            return res.status(200).json(cachedData);
         }
         
         // Build query with parameterized values
@@ -421,15 +508,15 @@ app.post('/predict-probability', async (req, res) => {
                 success: true,
                 message: "No historical data found for probability estimation",
                 probability: 0,
-                confidence: "low",
+                confidence: "none",
                 historicalData: []
             };
             
-            cacheResponse(cacheKey, responseData);
+            await cacheResponse(cacheKey, responseData, 86400);
             return res.status(200).json(responseData);
         }
         
-        // Improved probability calculation
+        // Enhanced probability calculation
         const rankNum = Number(userRank);
         const probabilities = [];
         const yearsData = [];
@@ -516,7 +603,7 @@ app.post('/predict-probability', async (req, res) => {
             message: getRecommendationMessage(finalProbability, confidence)
         };
         
-        cacheResponse(cacheKey, responseData);
+        await cacheResponse(cacheKey, responseData, 86400);
         res.status(200).json(responseData);
     } catch (error) {
         console.error("Probability estimation error:", error);
@@ -528,162 +615,25 @@ app.post('/predict-probability', async (req, res) => {
     }
 });
 
-// Helper function to cache response
-
-
-// Helper function to calculate confidence level
-function calculateConfidence(probabilities, yearsData) {
-    if (probabilities.length === 0) return "low";
-    
-    // More data points = higher confidence
-    if (probabilities.length >= 4) {
-        // Check consistency in trend
-        const stdDev = calculateStandardDeviation(probabilities);
-        
-        if (stdDev < 0.15) return "very high";
-        if (stdDev < 0.25) return "high";
-        return "medium";
-    } else if (probabilities.length >= 2) {
-        // Check consistency in recent years
-        const stdDev = calculateStandardDeviation(probabilities);
-        
-        if (stdDev < 0.2) return "medium";
-        return "low";
-    }
-    
-    // Only one data point - check recency
-    if (yearsData.length > 0 && yearsData[0].year >= new Date().getFullYear() - 2) {
-        return "low";
-    }
-    
-    return "very low";
-}
-
-// Helper function to calculate standard deviation
-function calculateStandardDeviation(values) {
-    const avg = values.reduce((sum, val) => sum + val, 0) / values.length;
-    const squareDiffs = values.map(value => Math.pow(value - avg, 2));
-    const avgSquareDiff = squareDiffs.reduce((sum, val) => sum + val, 0) / squareDiffs.length;
-    return Math.sqrt(avgSquareDiff);
-}
-
-// Helper function to generate recommendation message
-function getRecommendationMessage(probability, confidence) {
-    if (probability >= 0.9) {
-        return "You have an excellent chance of getting this seat based on historical data.";
-    } else if (probability >= 0.7) {
-        return "You have a good chance of getting this seat based on historical data.";
-    } else if (probability >= 0.5) {
-        return "You have a reasonable chance of getting this seat, but consider backup options.";
-    } else if (probability >= 0.3) {
-        return "Your chances are somewhat low. Consider this as a stretch option and have safer backups.";
-    } else if (probability >= 0.1) {
-        return "Your chances are quite low based on historical data. Consider other options.";
-    } else {
-        return "Historical data suggests very low probability. Consider exploring other programs or institutes.";
-    }
-}
-
-// Helper function to cache response
-function cacheResponse(key, data) {
-    if (redisClient.isReady) {
-        try {
-            redisClient.set(key, JSON.stringify(data), { EX: 3600 })
-                .catch(err => console.warn("Cache storage failed:", err.message));
-        } catch (err) {
-            console.warn("Cache attempt failed:", err.message);
-        }
-    }
-}
-
-// Calculate confidence level based on data consistency
-function calculateConfidence(probabilities, yearsData) {
-    if (probabilities.length === 0) return "none";
-    if (probabilities.length === 1) return "low";
-    
-    // Check for consistency in data
-    const variance = calculateVariance(probabilities);
-    
-    // Check trend stability
-    const isClosingRankStable = isStable(yearsData.map(d => d.closeRank));
-    
-    if (probabilities.length >= 4 && variance < 0.05 && isClosingRankStable) {
-        return "high";
-    } else if (probabilities.length >= 3 && variance < 0.1) {
-        return "medium";
-    } else {
-        return "low";
-    }
-}
-
-// Calculate statistical variance
-function calculateVariance(values) {
-    if (values.length <= 1) return 0;
-    
-    const mean = values.reduce((sum, val) => sum + val, 0) / values.length;
-    const squaredDiffs = values.map(val => Math.pow(val - mean, 2));
-    return squaredDiffs.reduce((sum, val) => sum + val, 0) / values.length;
-}
-
-// Check if a trend is stable
-function isStable(values) {
-    if (values.length <= 2) return true;
-    
-    // Calculate percentage changes
-    const changes = [];
-    for (let i = 1; i < values.length; i++) {
-        if (values[i-1] === 0) continue;
-        changes.push(Math.abs((values[i] - values[i-1]) / values[i-1]));
-    }
-    
-    // If average change is less than 15%, consider stable
-    return changes.reduce((sum, val) => sum + val, 0) / changes.length < 0.15;
-}
-
-// Get recommendation message based on probability
-function getRecommendationMessage(probability, confidence) {
-    if (confidence === "none" || confidence === "low") {
-        return "Limited historical data available. Consider this as a rough estimate.";
-    }
-    
-    if (probability >= 0.85) {
-        return "High probability of admission. This choice appears to be safe based on historical trends.";
-    } else if (probability >= 0.60) {
-        return "Good probability of admission. This appears to be a reasonable choice based on historical data.";
-    } else if (probability >= 0.30) {
-        return "Moderate probability. Consider this as a competitive option.";
-    } else {
-        return "Low probability based on historical data. Consider this as an ambitious choice.";
-    }
-}
 // Filter options endpoint
 app.get('/filter-options', async (req, res) => {
     const cacheKey = 'filter-options';
     
     try {
-        if (redisClient.isReady) {
-            const cachedData = await redisClient.get(cacheKey);
-            if (cachedData) {
-                return res.status(200).json(JSON.parse(cachedData));
-            }
+        // Check cache
+        const cachedData = await getFromCache(cacheKey);
+        if (cachedData) {
+            return res.status(200).json(cachedData);
         }
         
-        // Get distinct values for filter options
-        const yearsResult = await pool.query(
-            'SELECT DISTINCT "Year" FROM public.combined_josaa_in ORDER BY "Year" DESC'
-        );
-        const quotasResult = await pool.query(
-            'SELECT DISTINCT "Quota" FROM public.combined_josaa_in ORDER BY "Quota" ASC'
-        );
-        const seatTypesResult = await pool.query(
-            'SELECT DISTINCT "Seat Type" FROM public.combined_josaa_in ORDER BY "Seat Type" ASC'
-        );
-        const gendersResult = await pool.query(
-            'SELECT DISTINCT "Gender" FROM public.combined_josaa_in ORDER BY "Gender" ASC'
-        );
-        const roundsResult = await pool.query(
-            'SELECT DISTINCT "Round" FROM public.combined_josaa_in ORDER BY "Round" ASC'
-        );
+        // Use Promise.all for parallel queries to improve performance
+        const [yearsResult, quotasResult, seatTypesResult, gendersResult, roundsResult] = await Promise.all([
+            pool.query('SELECT DISTINCT "Year" FROM public.combined_josaa_in ORDER BY "Year" DESC'),
+            pool.query('SELECT DISTINCT "Quota" FROM public.combined_josaa_in ORDER BY "Quota" ASC'),
+            pool.query('SELECT DISTINCT "Seat Type" FROM public.combined_josaa_in ORDER BY "Seat Type" ASC'),
+            pool.query('SELECT DISTINCT "Gender" FROM public.combined_josaa_in ORDER BY "Gender" ASC'),
+            pool.query('SELECT DISTINCT "Round" FROM public.combined_josaa_in ORDER BY "Round" ASC')
+        ]);
         
         const options = {
             years: yearsResult.rows.map(row => row.Year),
@@ -693,10 +643,8 @@ app.get('/filter-options', async (req, res) => {
             rounds: roundsResult.rows.map(row => row.Round)
         };
         
-        if (redisClient.isReady) {
-            await redisClient.set(cacheKey, JSON.stringify(options), { EX: 86400 });
-        }
-        
+        // Cache results for longer (24 hours) since this data rarely changes
+        await cacheResponse(cacheKey, options, 86400);
         res.status(200).json(options);
     } catch (error) {
         console.error("Filter options error:", error);
