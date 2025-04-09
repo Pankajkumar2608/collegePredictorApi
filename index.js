@@ -529,20 +529,7 @@ app.post('/predict-probability', async (req, res) => {
 });
 
 // Helper function to cache response
-function cacheResponse(key, data) {
-    if (redisClient.isReady) {
-        try {
-            // Cache for 24 hours (86400 seconds)
-            redisClient.set(key, JSON.stringify(data), {
-                EX: 86400
-            }).catch(err => {
-                console.warn("Redis cache set error:", err.message);
-            });
-        } catch (e) {
-            console.warn("Redis cache operation failed:", e.message);
-        }
-    }
-}
+
 
 // Helper function to calculate confidence level
 function calculateConfidence(probabilities, yearsData) {
