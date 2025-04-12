@@ -539,15 +539,7 @@ app.post('/rank-trends', async (req, res) => {
         const params = [institute, program, SeatType, quota, gender];
         const result = await pool.query(query, params);
 
-        // Process data to potentially group by year (e.g., only last round per year) if needed
-        const trendData = {};
-        result.rows.forEach(row => {
-            if (!trendData[row.Year] || trendData[row.Year].Round < row.Round) {
-                 trendData[row.Year] = row; // Keep latest round for the year
-            }
-        });
-
-        const finalData = Object.values(trendData).sort((a, b) => a.Year - b.Year);
+        const finalData = result.rows.sort((a, b) => a.Year - b.Year);
 
 
         const responseData = {
