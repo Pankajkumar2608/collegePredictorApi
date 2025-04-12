@@ -36,8 +36,8 @@ const pool = new Pool({
     host: process.env.PGHOST,
     database: process.env.PGDATABASE,
     password: process.env.PGPASSWORD,
-    port: process.env.DB_PORT,
-    ssl: true,
+    port: process.env.PGPORT || process.env.DB_PORT, // Fixed inconsistent port env var name
+    ssl: process.env.NODE_ENV === 'production' ? true : false, // Only use SSL in production
 });
 
 // Helper function to cache response with better error handling
@@ -57,7 +57,8 @@ async function getFromCache(key) {
     if (!redisClient.isReady) return null;
     
     try {
-        return JSON.parse(await redisClient.get(key));
+        const data = await redisClient.get(key);
+        return data ? JSON.parse(data) : null; // Handle null/undefined value
     } catch (err) {
         console.warn(`Cache retrieval failed for key ${key}:`, err.message);
         return null;
@@ -78,11 +79,15 @@ function calculateStandardDeviation(values) {
 function isStable(values) {
     if (!values || values.length <= 2) return true;
     
+    // Filter out null values
+    const validValues = values.filter(val => val !== null && val !== undefined);
+    if (validValues.length <= 2) return true;
+    
     // Calculate percentage changes
     const changes = [];
-    for (let i = 1; i < values.length; i++) {
-        if (values[i-1] === 0) continue;
-        changes.push(Math.abs((values[i] - values[i-1]) / values[i-1]));
+    for (let i = 1; i < validValues.length; i++) {
+        if (validValues[i-1] === 0) continue;
+        changes.push(Math.abs((validValues[i] - validValues[i-1]) / validValues[i-1]));
     }
     
     // If average change is less than 15%, consider stable
@@ -95,19 +100,25 @@ function calculateConfidence(probabilities, yearsData) {
     if (!probabilities || probabilities.length === 0) return "none";
     if (probabilities.length === 1) return "low";
     
+    // Filter out invalid values
+    const validProbs = probabilities.filter(p => !isNaN(p) && p !== null);
+    if (validProbs.length === 0) return "none";
+    if (validProbs.length === 1) return "low";
+    
     // Calculate standard deviation for consistency check
-    const stdDev = calculateStandardDeviation(probabilities);
+    const stdDev = calculateStandardDeviation(validProbs);
     
     // Check trend stability in closing ranks
-    const isClosingRankStable = isStable(yearsData.map(d => d.closeRank));
+    const closingRanks = yearsData.map(d => d.closeRank).filter(rank => rank !== null && !isNaN(rank));
+    const isClosingRankStable = isStable(closingRanks);
     
-    if (probabilities.length >= 4 && stdDev < 0.15 && isClosingRankStable) {
+    if (validProbs.length >= 4 && stdDev < 0.15 && isClosingRankStable) {
         return "very high";
-    } else if (probabilities.length >= 4 && stdDev < 0.25) {
+    } else if (validProbs.length >= 4 && stdDev < 0.25) {
         return "high";
-    } else if (probabilities.length >= 3 && stdDev < 0.2) {
+    } else if (validProbs.length >= 3 && stdDev < 0.2) {
         return "medium";
-    } else if (probabilities.length >= 2) {
+    } else if (validProbs.length >= 2) {
         return "low";
     }
     
@@ -245,11 +256,10 @@ app.post('/filter', async (req, res) => {
             paramIndex++;
         }
 
+        // Fixed the duplicate userRank parameter issue
         if (userRank) {
-            filterQuery += ` AND NULLIF("Opening Rank", '')::INTEGER <= $${paramIndex} 
-                            AND NULLIF("Closing Rank", '')::INTEGER >= $${paramIndex}`;
-            params.push(userRankInt);
-            paramIndex++;
+            filterQuery += ` AND NULLIF("Opening Rank", '')::INTEGER <= $1 
+                            AND NULLIF("Closing Rank", '')::INTEGER >= $1`;
             filterQuery += ` ORDER BY rank_diff ASC `;
         } else {
             filterQuery += ` ORDER BY NULLIF("Opening Rank", '')::INTEGER ASC `;
@@ -387,8 +397,8 @@ app.post('/rank-trends', async (req, res) => {
         
         let query = `
             SELECT "Year", "Round", 
-                   NULLIF("Opening Rank", '')::INTEGER AS "Opening Rank", 
-                   NULLIF("Closing Rank", '')::INTEGER AS "Closing Rank"
+                   NULLIF("Opening Rank", '')::INTEGER AS "openRank", 
+                   NULLIF("Closing Rank", '')::INTEGER AS "closeRank"
             FROM public.combined_josaa_in
             WHERE 1=1
         `;
@@ -475,8 +485,8 @@ app.post('/predict-probability', async (req, res) => {
         
         let query = `
             SELECT "Year", 
-                   NULLIF("Opening Rank", '')::INTEGER AS "Opening Rank", 
-                   NULLIF("Closing Rank", '')::INTEGER AS "Closing Rank"
+                   NULLIF("Opening Rank", '')::INTEGER AS "openRank", 
+                   NULLIF("Closing Rank", '')::INTEGER AS "closeRank"
             FROM public.combined_josaa_in
             WHERE 1=1
         `;
@@ -523,8 +533,8 @@ app.post('/predict-probability', async (req, res) => {
         const currentYear = new Date().getFullYear();
         
         result.rows.forEach(row => {
-            const openRank = Number(row["Opening Rank"]);
-            const closeRank = Number(row["Closing Rank"]);
+            const openRank = Number(row.openRank);
+            const closeRank = Number(row.closeRank);
             let rowProbability = 0;
             
             if (!isNaN(openRank) && !isNaN(closeRank) && openRank > 0 && closeRank > 0) {
@@ -534,47 +544,42 @@ app.post('/predict-probability', async (req, res) => {
                     // assign full probability for better ranks, or 0.99 for an exact match.
                     rowProbability = rankNum === closeRank ? 0.99 : 1;
                 } else if (diff <= 40) {
-                    // For differences from 1 to 40, interpolate linearly between 0.98 and 0.491.
+                    // For differences from 1 to 40, interpolate linearly between 0.98 and 0.70.
                     const maxProb = 0.98; // probability when diff is 1
                     const minProb = 0.70; // probability when diff is 40
                     rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 1) / (40 - 1))).toFixed(3);
                 } else if (diff <= 50) {
-                    // For differences from 41 to 50, interpolate linearly between 0.33 and 0.15.
+                    // For differences from 41 to 50, interpolate linearly between 0.69 and 0.50.
                     const maxProb = 0.69; // probability when diff is 41
                     const minProb = 0.50; // probability when diff is 50
                     rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 41) / (50 - 41))).toFixed(3);
-                } else if (diff <= 90) {
-                    // For differences from 51 to 60, interpolate linearly between 0.15 and 0.05.
+                } else if (diff <= 60) {
+                    // For differences from 51 to 60, interpolate linearly between 0.49 and 0.30.
                     const maxProb = 0.49; // probability when diff is 51
                     const minProb = 0.30; // probability when diff is 60
                     rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 51) / (60 - 51))).toFixed(3);
-                }
-                else if (diff <= 150) {
-                    // For differences from 61 to 70, interpolate linearly between 0.05 and 0.01.
+                } else if (diff <= 70) {
+                    // For differences from 61 to 70, interpolate linearly between 0.29 and 0.15.
                     const maxProb = 0.29; // probability when diff is 61
                     const minProb = 0.15; // probability when diff is 70
                     rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 61) / (70 - 61))).toFixed(3);
-                }
-                else if (diff <= 200) {
-                    // For differences from 71 to 80, interpolate linearly between 0.01 and 0.005.
-                    const maxProb = 0.15; // probability when diff is 71
+                } else if (diff <= 80) {
+                    // For differences from 71 to 80, interpolate linearly between 0.14 and 0.10.
+                    const maxProb = 0.14; // probability when diff is 71
                     const minProb = 0.10; // probability when diff is 80
-                    }
-                else {
+                    rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 71) / (80 - 71))).toFixed(3);
+                } else {
                     // For larger differences return the minimum probability.
-                    rowProbability = 0.5;
+                    rowProbability = 0.05;
                 }
-                    
-                } 
-                
                 
                 // Apply recency bias - more recent years should have even more weight
-                const recencyFactor = row["Year"] === currentYear - 1 ? 1.5 : 1;
+                const recencyFactor = row.Year === currentYear - 1 ? 1.5 : 1;
                 rowProbability *= recencyFactor;
                 
                 probabilities.push(rowProbability);
                 yearsData.push({
-                    year: row["Year"],
+                    year: row.Year,
                     openRank,
                     closeRank,
                     probability: Math.min(rowProbability, 0.99) // Cap at 0.99
@@ -594,13 +599,13 @@ app.post('/predict-probability', async (req, res) => {
                 weightSum += weight;
             });
             
-            finalProbability = finalProbability / weightSum;
+            finalProbability = weightSum > 0 ? finalProbability / weightSum : 0;
             
             // Add pessimistic correction for borderline cases
             // If the rank is close to the most recent year's closing rank
             if (yearsData.length > 0) {
                 const mostRecentYear = yearsData[0];
-                if (rankNum > mostRecentYear.closeRank * 0.95) {
+                if (rankNum > mostRecentYear.closeRank * 0.95 && mostRecentYear.closeRank > 0) {
                     // Apply correction factor for ranks near the threshold
                     const correction = Math.min(1, (rankNum - mostRecentYear.closeRank * 0.95) / 
                                                (mostRecentYear.closeRank * 0.05));
@@ -672,6 +677,31 @@ app.get('/filter-options', async (req, res) => {
         });
     }
 });
+
+// Add graceful shutdown handlers
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
+
+async function gracefulShutdown() {
+    console.log('Shutting down gracefully...');
+    
+    try {
+        // Close Redis connection
+        if (redisClient.isReady) {
+            await redisClient.quit();
+            console.log('Redis connection closed');
+        }
+        
+        // Close database pool
+        await pool.end();
+        console.log('Database connection pool closed');
+        
+        process.exit(0);
+    } catch (err) {
+        console.error('Error during shutdown:', err);
+        process.exit(1);
+    }
+}
 
 // Global error handler middleware
 app.use((err, req, res, next) => {
