@@ -178,7 +178,7 @@ app.get('/health', async (req, res) => {
     }
 });
 
-// Filter endpoint
+// Filter endpoint with ordering information
 app.post('/filter', async (req, res) => {
     const { 
         institute, 
@@ -256,12 +256,17 @@ app.post('/filter', async (req, res) => {
             paramIndex++;
         }
 
+        // Store the ordering method for future reference
+        let orderBy = "closing_rank";
+        
         // Fixed the duplicate userRank parameter issue
         if (userRank) {
             filterQuery += ` AND NULLIF("Closing Rank", '')::INTEGER >= $1`;
             filterQuery += ` ORDER BY rank_diff ASC `;
+            orderBy = "rank_diff";
         } else {
             filterQuery += ` ORDER BY NULLIF("Closing Rank", '')::INTEGER ASC `;
+            orderBy = "closing_rank";
         }
 
         filterQuery += ` LIMIT 100`;
@@ -271,7 +276,8 @@ app.post('/filter', async (req, res) => {
             success: true,
             count: result.rows.length,
             message: result.rows.length === 0 ? "No matches found for the given criteria" : null,
-            filterData: result.rows
+            filterData: result.rows,
+            orderBy: orderBy // Include ordering information in response
         };
 
         // Cache the result
@@ -374,9 +380,9 @@ app.get('/suggest-programs', async (req, res) => {
     }
 });
 
-// Rank trends endpoint
+// Improved Rank trends endpoint
 app.post('/rank-trends', async (req, res) => {
-    const { institute, program, SeatType, quota, gender } = req.body;
+    const { institute, program, SeatType, quota, gender, orderBy } = req.body;
     
     if (!institute && !program) {
         return res.status(400).json({
@@ -397,7 +403,8 @@ app.post('/rank-trends', async (req, res) => {
         let query = `
             SELECT "Year", "Round", 
                    NULLIF("Opening Rank", '')::INTEGER AS "openRank", 
-                   NULLIF("Closing Rank", '')::INTEGER AS "closeRank"
+                   NULLIF("Closing Rank", '')::INTEGER AS "closeRank",
+                   "Institute", "Academic Program Name", "Seat Type", "Quota", "Gender"
             FROM public.combined_josaa_in
             WHERE 1=1
         `;
@@ -434,14 +441,55 @@ app.post('/rank-trends', async (req, res) => {
             paramIndex++;
         }
         
-        query += ` ORDER BY "Year" ASC, "Round" ASC`;
+        // Consistent ordering with filter endpoint
+        if (orderBy === "rank_diff" && req.body.userRank) {
+            const userRankInt = parseInt(req.body.userRank, 10);
+            query += ` ORDER BY ABS(NULLIF("Closing Rank", '')::INTEGER - ${userRankInt}) ASC, "Year" DESC`;
+        } else {
+            query += ` ORDER BY "Year" DESC, "Round" DESC`;
+        }
         
         const result = await pool.query(query, params);
         
+        // Structure the data for better frontend visualization
+        const trends = [];
+        const uniquePrograms = new Map();
+        
+        // Group data by program/institute combination
+        result.rows.forEach(row => {
+            const key = `${row.Institute}-${row["Academic Program Name"]}-${row["Seat Type"]}-${row.Quota}-${row.Gender}`;
+            
+            if (!uniquePrograms.has(key)) {
+                uniquePrograms.set(key, {
+                    institute: row.Institute,
+                    program: row["Academic Program Name"],
+                    seatType: row["Seat Type"],
+                    quota: row.Quota,
+                    gender: row.Gender,
+                    yearData: []
+                });
+            }
+            
+            uniquePrograms.get(key).yearData.push({
+                year: row.Year,
+                round: row.Round,
+                openRank: row.openRank,
+                closeRank: row.closeRank
+            });
+        });
+        
+        // Convert map to array for response
+        uniquePrograms.forEach(program => {
+            // Sort year data chronologically for better trend visualization
+            program.yearData.sort((a, b) => a.year - b.year);
+            trends.push(program);
+        });
+        
         const responseData = {
             success: true,
-            message: result.rows.length === 0 ? "No trend data found for the given criteria" : null,
-            data: result.rows
+            message: trends.length === 0 ? "No trend data found for the given criteria" : null,
+            data: trends,
+            orderBy: orderBy // Include ordering parameter in response
         };
         
         // Cache the results
@@ -459,7 +507,7 @@ app.post('/rank-trends', async (req, res) => {
 
 // Improved Probability prediction endpoint
 app.post('/predict-probability', async (req, res) => {
-    const { userRank, institute, program, SeatType, quota, gender } = req.body;
+    const { userRank, institute, program, SeatType, quota, gender, orderBy } = req.body;
     
     // Validate required parameters
     if (!userRank || isNaN(Number(userRank)) || Number(userRank) <= 0) {
@@ -485,7 +533,8 @@ app.post('/predict-probability', async (req, res) => {
         let query = `
             SELECT "Year", 
                    NULLIF("Opening Rank", '')::INTEGER AS "openRank", 
-                   NULLIF("Closing Rank", '')::INTEGER AS "closeRank"
+                   NULLIF("Closing Rank", '')::INTEGER AS "closeRank",
+                   "Institute", "Academic Program Name"
             FROM public.combined_josaa_in
             WHERE 1=1
         `;
@@ -518,7 +567,10 @@ app.post('/predict-probability', async (req, res) => {
                 message: "No historical data found for probability estimation",
                 probability: 0,
                 confidence: "none",
-                historicalData: []
+                historicalData: [],
+                instituteName: institute,
+                programName: program,
+                orderBy: orderBy // Preserve ordering parameter
             };
             
             await cacheResponse(cacheKey, responseData, 86400);
@@ -538,50 +590,38 @@ app.post('/predict-probability', async (req, res) => {
             
             if (!isNaN(openRank) && !isNaN(closeRank) && openRank > 0 && closeRank > 0) {
                 const diff = rankNum - closeRank;
+                
+                // Improved probability calculation logic
                 if (diff <= 0) {
-                    // If user rank is better than or exactly equal to closing rank,
-                    // assign full probability for better ranks, or 0.99 for an exact match.
+                    // If user rank is better than or equal to closing rank
                     rowProbability = rankNum === closeRank ? 0.99 : 1;
                 } else if (diff <= 40) {
-                    // For differences from 1 to 40, interpolate linearly between 0.98 and 0.70.
-                    const maxProb = 0.98; // probability when diff is 1
-                    const minProb = 0.70; // probability when diff is 40
-                    rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 1) / (40 - 1))).toFixed(3);
+                    // For differences from 1 to 40, interpolate between 0.98 and 0.70
+                    rowProbability = 0.98 - 0.28 * (diff / 40);
                 } else if (diff <= 50) {
-                    // For differences from 41 to 50, interpolate linearly between 0.69 and 0.50.
-                    const maxProb = 0.69; // probability when diff is 41
-                    const minProb = 0.50; // probability when diff is 50
-                    rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 41) / (50 - 41))).toFixed(3);
+                    // For differences from 41 to 50, interpolate between 0.69 and 0.50
+                    rowProbability = 0.69 - 0.19 * ((diff - 40) / 10);
                 } else if (diff <= 60) {
-                    // For differences from 51 to 60, interpolate linearly between 0.49 and 0.30.
-                    const maxProb = 0.49; // probability when diff is 51
-                    const minProb = 0.30; // probability when diff is 60
-                    rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 51) / (60 - 51))).toFixed(3);
+                    // For differences from 51 to 60, interpolate between 0.49 and 0.30
+                    rowProbability = 0.49 - 0.19 * ((diff - 50) / 10);
                 } else if (diff <= 70) {
-                    // For differences from 61 to 70, interpolate linearly between 0.29 and 0.15.
-                    const maxProb = 0.29; // probability when diff is 61
-                    const minProb = 0.15; // probability when diff is 70
-                    rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 61) / (70 - 61))).toFixed(3);
+                    // For differences from 61 to 70, interpolate between 0.29 and 0.15
+                    rowProbability = 0.29 - 0.14 * ((diff - 60) / 10);
                 } else if (diff <= 80) {
-                    // For differences from 71 to 80, interpolate linearly between 0.14 and 0.10.
-                    const maxProb = 0.14; // probability when diff is 71
-                    const minProb = 0.10; // probability when diff is 80
-                    rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 71) / (80 - 71))).toFixed(3);
+                    // For differences from 71 to 80, interpolate between 0.14 and 0.10
+                    rowProbability = 0.14 - 0.04 * ((diff - 70) / 10);
                 } else {
-                    // For larger differences return the minimum probability.
+                    // For larger differences, use a minimum probability
                     rowProbability = 0.05;
                 }
                 
-                // Apply recency bias - more recent years should have even more weight
-                const recencyFactor = row.Year === currentYear - 1 ? 1.5 : 1;
-                rowProbability *= recencyFactor;
-                
+                // Fixed: No recency factor here as it will be applied in weighted averaging
                 probabilities.push(rowProbability);
                 yearsData.push({
                     year: row.Year,
                     openRank,
                     closeRank,
-                    probability: Math.min(rowProbability, 0.99) // Cap at 0.99
+                    probability: Math.min(rowProbability, 0.99) // Cap individual probability at 0.99
                 });
             }
         });
@@ -592,7 +632,7 @@ app.post('/predict-probability', async (req, res) => {
         
         if (probabilities.length > 0) {
             probabilities.forEach((prob, index) => {
-                // Exponential weighting for recent years
+                // More recent years get exponentially more weight
                 const weight = Math.pow(1.5, probabilities.length - index - 1);
                 finalProbability += prob * weight;
                 weightSum += weight;
@@ -600,15 +640,15 @@ app.post('/predict-probability', async (req, res) => {
             
             finalProbability = weightSum > 0 ? finalProbability / weightSum : 0;
             
-            // Add pessimistic correction for borderline cases
-            // If the rank is close to the most recent year's closing rank
+            // Simplified pessimistic correction
             if (yearsData.length > 0) {
                 const mostRecentYear = yearsData[0];
-                if (rankNum > mostRecentYear.closeRank * 0.95 && mostRecentYear.closeRank > 0) {
-                    // Apply correction factor for ranks near the threshold
-                    const correction = Math.min(1, (rankNum - mostRecentYear.closeRank * 0.95) / 
+                // Only apply a smaller correction if rank is very close to threshold
+                if (rankNum > mostRecentYear.closeRank && rankNum <= mostRecentYear.closeRank * 1.05) {
+                    // Apply a gentler correction factor
+                    const correction = Math.min(1, (rankNum - mostRecentYear.closeRank) / 
                                                (mostRecentYear.closeRank * 0.05));
-                    finalProbability *= (1 - correction * 0.3);
+                    finalProbability *= (1 - correction * 0.1); // Reduced correction factor
                 }
             }
         }
@@ -621,7 +661,10 @@ app.post('/predict-probability', async (req, res) => {
             probability: Math.min(Math.round(finalProbability * 100) / 100, 0.99),
             confidence,
             historicalData: yearsData,
-            message: getRecommendationMessage(finalProbability, confidence)
+            message: getRecommendationMessage(finalProbability, confidence),
+            instituteName: institute || result.rows[0].Institute,
+            programName: program || result.rows[0]["Academic Program Name"],
+            orderBy: orderBy // Preserve ordering parameter from request
         };
         
         await cacheResponse(cacheKey, responseData, 86400);
