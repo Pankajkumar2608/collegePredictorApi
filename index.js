@@ -258,11 +258,10 @@ app.post('/filter', async (req, res) => {
 
         // Fixed the duplicate userRank parameter issue
         if (userRank) {
-            filterQuery += ` AND NULLIF("Opening Rank", '')::INTEGER <= $1 
-                            AND NULLIF("Closing Rank", '')::INTEGER >= $1`;
+            filterQuery += ` AND NULLIF("Closing Rank", '')::INTEGER >= $1`;
             filterQuery += ` ORDER BY rank_diff DESC `;
         } else {
-            filterQuery += ` ORDER BY NULLIF("Opening Rank", '')::INTEGER ASC `;
+            filterQuery += ` ORDER BY NULLIF("Closing Rank", '')::INTEGER ASC `;
         }
 
         filterQuery += ` LIMIT 100`;
