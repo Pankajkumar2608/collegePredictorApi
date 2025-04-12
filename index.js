@@ -338,7 +338,7 @@ app.post('/filter', async (req, res) => {
         }
 
         // Limit initial results to avoid overwhelming processing
-        filterQuery += ` LIMIT 150`; // Adjust limit as needed
+        filterQuery += ` LIMIT 80`; // Adjust limit as needed
 
         const initialResult = await pool.query(filterQuery, params);
         let filteredData = initialResult.rows;
