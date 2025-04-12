@@ -474,7 +474,6 @@ app.post('/predict-probability', async (req, res) => {
 
         let query = `
             SELECT "Year", 
-                   NULLIF("Opening Rank", '')::INTEGER AS "Opening Rank", 
                    NULLIF("Closing Rank", '')::INTEGER AS "Closing Rank"
             FROM public.combined_josaa_in
             WHERE 1=1
