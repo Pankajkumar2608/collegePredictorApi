@@ -260,7 +260,7 @@ app.post('/filter', async (req, res) => {
         if (userRank) {
             filterQuery += ` AND NULLIF("Opening Rank", '')::INTEGER <= $1 
                             AND NULLIF("Closing Rank", '')::INTEGER >= $1`;
-            filterQuery += ` ORDER BY rank_diff DSC `;
+            filterQuery += ` ORDER BY rank_diff DESC `;
         } else {
             filterQuery += ` ORDER BY NULLIF("Opening Rank", '')::INTEGER ASC `;
         }
