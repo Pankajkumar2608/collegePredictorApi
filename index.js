@@ -528,28 +528,45 @@ app.post('/predict-probability', async (req, res) => {
             let rowProbability = 0;
             
             if (!isNaN(openRank) && !isNaN(closeRank) && openRank > 0 && closeRank > 0) {
-                if (rankNum <= closeRank) {
-                    if (rankNum <= openRank) {
-                        // Rank better than opening rank (high probability)
-                        rowProbability = 0.99;
-                    } else {
-                        // Rank between opening and closing (more aggressive scaling)
-                        const position = (rankNum - openRank) / (closeRank - openRank);
-                        // More steep decline as you approach closing rank
-                        rowProbability = 0.95 - (Math.pow(position, 0.8) * 0.75);
-                    }
-                } else {
-                    // Rank worse than closing rank (more rapid decay)
-                    const difference = rankNum - closeRank;
-                    const threshold = closeRank * 0.05; // Reduced threshold for stricter cutoff
-                    
-                    if (difference <= threshold) {
-                        // Exponential decay instead of linear
-                        rowProbability = 0.15 * Math.exp(-3 * (difference / threshold));
-                    } else {
-                        rowProbability = 0.01; // Even lower base probability for ranks well beyond closing
-                    }
+                const diff = rankNum - closeRank;
+                if (diff <= 0) {
+                    // If user rank is better than or exactly equal to closing rank,
+                    // assign full probability for better ranks, or 0.99 for an exact match.
+                    rowProbability = rankNum === closeRank ? 0.99 : 1;
+                } else if (diff <= 40) {
+                    // For differences from 1 to 40, interpolate linearly between 0.98 and 0.491.
+                    const maxProb = 0.98; // probability when diff is 1
+                    const minProb = 0.70; // probability when diff is 40
+                    rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 1) / (40 - 1))).toFixed(3);
+                } else if (diff <= 50) {
+                    // For differences from 41 to 50, interpolate linearly between 0.33 and 0.15.
+                    const maxProb = 0.69; // probability when diff is 41
+                    const minProb = 0.50; // probability when diff is 50
+                    rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 41) / (50 - 41))).toFixed(3);
+                } else if (diff <= 90) {
+                    // For differences from 51 to 60, interpolate linearly between 0.15 and 0.05.
+                    const maxProb = 0.49; // probability when diff is 51
+                    const minProb = 0.30; // probability when diff is 60
+                    rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 51) / (60 - 51))).toFixed(3);
                 }
+                else if (diff <= 150) {
+                    // For differences from 61 to 70, interpolate linearly between 0.05 and 0.01.
+                    const maxProb = 0.29; // probability when diff is 61
+                    const minProb = 0.15; // probability when diff is 70
+                    rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 61) / (70 - 61))).toFixed(3);
+                }
+                else if (diff <= 200) {
+                    // For differences from 71 to 80, interpolate linearly between 0.01 and 0.005.
+                    const maxProb = 0.15; // probability when diff is 71
+                    const minProb = 0.10; // probability when diff is 80
+                    }
+                else {
+                    // For larger differences return the minimum probability.
+                    rowProbability = 0.5;
+                }
+                    
+                } 
+                
                 
                 // Apply recency bias - more recent years should have even more weight
                 const recencyFactor = row["Year"] === currentYear - 1 ? 1.5 : 1;
