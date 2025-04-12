@@ -246,13 +246,12 @@ app.post('/filter', async (req, res) => {
         }
 
         if (userRank) {
-            filterQuery += ` AND NULLIF("Opening Rank", '')::INTEGER <= $${paramIndex} 
-                            AND NULLIF("Closing Rank", '')::INTEGER >= $${paramIndex}`;
+            filterQuery += `AND NULLIF("Closing Rank", '')::INTEGER >= $${paramIndex}`;
             params.push(userRankInt);
             paramIndex++;
             filterQuery += ` ORDER BY rank_diff ASC `;
         } else {
-            filterQuery += ` ORDER BY NULLIF("Opening Rank", '')::INTEGER ASC `;
+            filterQuery += ` ORDER BY NULLIF("Closing Rank", '')::INTEGER ASC `;
         }
 
         filterQuery += ` LIMIT 50`;
@@ -500,6 +499,7 @@ app.post('/predict-probability', async (req, res) => {
 
         // Get last 5 years of data for better statistical significance
         query += ` ORDER BY "Year" DESC LIMIT 5`;
+        
 
         const result = await pool.query(query, queryParams);
 
@@ -522,65 +522,54 @@ app.post('/predict-probability', async (req, res) => {
         const yearsData = [];
         const currentYear = new Date().getFullYear();
 
-        result.rows.forEach(row => {
-            const openRank = Number(row["Opening Rank"]);
-            const closeRank = Number(row["Closing Rank"]);
-            let rowProbability = 0;
+       result.rows.forEach(row => {
+    const openRank = Number(row["Opening Rank"]);
+    const closeRank = Number(row["Closing Rank"]);
+    let rowProbability = 0;
 
-            if (!isNaN(openRank) && !isNaN(closeRank) && openRank > 0 && closeRank > 0) {
-                const diff = rankNum - closeRank;
-                if (diff <= 0) {
-                    // If user rank is better than or exactly equal to closing rank,
-                    // assign full probability for better ranks, or 0.99 for an exact match.
-                    rowProbability = rankNum === closeRank ? 0.99 : 1;
-                } else if (diff <= 40) {
-                    // For differences from 1 to 40, interpolate linearly between 0.98 and 0.491.
-                    const maxProb = 0.98; // probability when diff is 1
-                    const minProb = 0.70; // probability when diff is 40
-                    rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 1) / (40 - 1))).toFixed(3);
-                } else if (diff <= 50) {
-                    // For differences from 41 to 50, interpolate linearly between 0.33 and 0.15.
-                    const maxProb = 0.69; // probability when diff is 41
-                    const minProb = 0.50; // probability when diff is 50
-                    rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 41) / (50 - 41))).toFixed(3);
-                } else if (diff <= 90) {
-                    // For differences from 51 to 60, interpolate linearly between 0.15 and 0.05.
-                    const maxProb = 0.49; // probability when diff is 51
-                    const minProb = 0.30; // probability when diff is 60
-                    rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 51) / (60 - 51))).toFixed(3);
-                }
-                else if (diff <= 150) {
-                    // For differences from 61 to 70, interpolate linearly between 0.05 and 0.01.
-                    const maxProb = 0.29; // probability when diff is 61
-                    const minProb = 0.15; // probability when diff is 70
-                    rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 61) / (70 - 61))).toFixed(3);
-                }
-                else if (diff <= 200) {
-                    // For differences from 71 to 80, interpolate linearly between 0.01 and 0.005.
-                    const maxProb = 0.15; // probability when diff is 71
-                    const minProb = 0.10; // probability when diff is 80
-                    }
-                else {
-                    // For larger differences return the minimum probability.
-                    rowProbability = 0.5;
-                }
-                    
-                } 
-                
+    if (!isNaN(openRank) && !isNaN(closeRank) && openRank > 0 && closeRank > 0) {
+        const diff = rankNum - closeRank;
+        
+        if (diff <= 0) {
+            rowProbability = rankNum === closeRank ? 0.99 : 1;
+        } else if (diff <= 40) {
+            // 1-40 ranks above closing: 98% to 70%
+            const maxProb = 0.98;
+            const minProb = 0.70;
+            rowProbability = +(maxProb - (maxProb - minProb) * (diff / 40)).toFixed(3);
+        } else if (diff <= 80) {
+            // 41-80 ranks above: 69% to 50%
+            const maxProb = 0.69;
+            const minProb = 0.50;
+            rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 40) / 40)).toFixed(3);
+        } else if (diff <= 120) {
+            // 81-120 ranks above: 49% to 30%
+            const maxProb = 0.49;
+            const minProb = 0.30;
+            rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 80) / 40)).toFixed(3);
+        } else if (diff <= 200) {
+            // 121-200 ranks above: 29% to 15%
+            const maxProb = 0.29;
+            const minProb = 0.15;
+            rowProbability = +(maxProb - (maxProb - minProb) * ((diff - 120) / 80)).toFixed(3);
+        } else {
+            // More than 200 ranks above: minimal chance
+            rowProbability = 0.05;
+        }
 
-                // Apply recency bias - more recent years should have even more weight
-                const recencyFactor = row["Year"] === currentYear - 1 ? 1.5 : 1;
-                rowProbability *= recencyFactor;
+        // Apply recency bias
+        const recencyFactor = row["Year"] === currentYear - 1 ? 1.5 : 1;
+        rowProbability = Math.min(rowProbability * recencyFactor, 0.99);
 
-                probabilities.push(rowProbability);
-                yearsData.push({
-                    year: row["Year"],
-                    openRank,
-                    closeRank,
-                    probability: Math.min(rowProbability, 0.99) // Cap at 0.99
-                });
-            }
+        probabilities.push(rowProbability);
+        yearsData.push({
+            year: row["Year"],
+            openRank,
+            closeRank,
+            probability: rowProbability
         });
+    }
+});
 
         // Calculate final probability with enhanced weighted average
         let finalProbability = 0;
