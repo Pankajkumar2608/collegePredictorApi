@@ -246,7 +246,7 @@ app.post('/filter', async (req, res) => {
         }
 
         if (userRank) {
-            filterQuery += `AND NULLIF("Closing Rank", '')::INTEGER >= $${paramIndex}`;
+            filterQuery += ` AND NULLIF("Closing Rank", '')::INTEGER >= $${paramIndex}`;
             params.push(userRankInt);
             paramIndex++;
             filterQuery += ` ORDER BY rank_diff ASC `;
