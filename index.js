@@ -337,9 +337,6 @@ app.post('/filter', async (req, res) => {
             filterQuery += ` ORDER BY "Year" DESC, "Round" DESC, "Institute" ASC, "Academic Program Name" ASC, NULLIF("Closing Rank", '')::INTEGER ASC`;
         }
 
-        // Limit initial results to avoid overwhelming processing
-        filterQuery += ` LIMIT 80`; // Adjust limit as needed
-
         const initialResult = await pool.query(filterQuery, params);
         let filteredData = initialResult.rows;
 
