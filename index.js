@@ -93,11 +93,11 @@ function calculateConfidence(probabilities, yearsData) {
     const isClosingRankStable = isStable(closingRanks);
 
     // Refined confidence logic
-    if (n >= 4 && stdDev < 0.15 && isClosingRankStable) return "very high";
-    if (n >= 4 && stdDev < 0.25) return "high";
-    if (n >= 3 && stdDev < 0.20 && isClosingRankStable) return "high"; // Added stable check
-    if (n >= 3 && stdDev < 0.30) return "medium";
-    if (n >= 2 && stdDev < 0.25) return "medium"; // Adjusted threshold
+    if (n >= 4 && stdDev < 0.15 && isClosingRankStable) return "very low";
+    if (n >= 4 && stdDev < 0.25) return "low";
+    if (n >= 3 && stdDev < 0.20 && isClosingRankStable) return "medium"; // Added stable check
+    if (n >= 3 && stdDev < 0.30) return "high";
+    if (n >= 2 && stdDev < 0.25) return "very high"; // Adjusted threshold
     return "low"; // Default for 2+ points if not meeting higher criteria
 }
 
