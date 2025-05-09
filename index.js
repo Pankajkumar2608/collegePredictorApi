@@ -240,6 +240,7 @@ app.get('/health', async (req, res) => {
 });
 
 // *** Unified Filter & Probability Endpoint ***
+// *** Unified Filter & Probability Endpoint ***
 app.post('/filter', async (req, res) => {
     const {
         institute,
@@ -288,10 +289,18 @@ app.post('/filter', async (req, res) => {
                 "Round",
                 NULLIF("Opening Rank", '')::INTEGER AS "Opening Rank",
                 NULLIF("Closing Rank", '')::INTEGER AS "Closing Rank"
-                ${userRankInt ? `, ABS(NULLIF("Closing Rank", '')::INTEGER - $1) AS rank_diff` : ''}
+        `;
+        
+        // Only add rank_diff calculation if userRank is provided
+        if (userRankInt) {
+            filterQuery += `, ABS(NULLIF("Closing Rank", '')::INTEGER - $1) AS rank_diff`;
+        }
+        
+        filterQuery += `
             FROM public.combined_josaa_in
             WHERE 1=1
         `;
+        
         const params = [];
         let paramIndex = 1;
 
@@ -324,15 +333,13 @@ app.post('/filter', async (req, res) => {
             }
         });
 
-        // --- Ordering ---
-        // If userRank is provided, order by closeness to the user's rank (within a reasonable threshold perhaps)
-        // If not, order by closing rank ascending or another default.
-        // We only fetch the *latest* round/year matching criteria here for the *initial* list.
-        // We will fetch full history later for probability calculation.
+        // Modified to handle empty string in a safer way
         if (userRankInt) {
-             // Prioritize results where closing rank is somewhat close to user rank
+            // Prioritize results where closing rank is somewhat close to user rank
+            // Make sure we only check for valid closing ranks
+            filterQuery += ` AND NULLIF("Closing Rank", '') IS NOT NULL`;
             filterQuery += ` AND NULLIF("Closing Rank", '')::INTEGER >= $1 - 500`; // Example: Look up to 500 ranks below user rank
-             filterQuery += ` ORDER BY "Year" DESC, "Round" DESC, rank_diff ASC`;
+            filterQuery += ` ORDER BY "Year" DESC, "Round" DESC, rank_diff ASC`;
         } else {
             filterQuery += ` ORDER BY "Year" DESC, "Round" DESC, "Institute" ASC, "Academic Program Name" ASC, NULLIF("Closing Rank", '')::INTEGER ASC`;
         }
@@ -386,9 +393,9 @@ app.post('/filter', async (req, res) => {
                     historicalDataGrouped[key] = [];
                 }
                 // Keep only the last round's data for each year for simplicity in probability trend
-                 if (!historicalDataGrouped[key].some(existing => existing.Year === row.Year)) {
+                if (!historicalDataGrouped[key].some(existing => existing.Year === row.Year)) {
                     historicalDataGrouped[key].push(row);
-                 }
+                }
             });
 
             // --- Step 3: Augment Filtered Data with Probability ---
@@ -407,18 +414,18 @@ app.post('/filter', async (req, res) => {
                 };
             });
 
-             // Re-sort based on probability AND rank difference if desired
-             filteredData.sort((a, b) => {
-                 // Prioritize higher probability
-                 if (b.probability !== a.probability) {
-                     return b.probability - a.probability;
-                 }
-                 // Then prioritize closer rank difference
-                 return a.rank_diff - b.rank_diff;
-             });
+            // Re-sort based on probability AND rank difference if desired
+            filteredData.sort((a, b) => {
+                // Prioritize higher probability
+                if (b.probability !== a.probability) {
+                    return b.probability - a.probability;
+                }
+                // Then prioritize closer rank difference
+                return a.rank_diff - b.rank_diff;
+            });
 
-             // Optional: Filter out very low probability results if the list is long
-             // filteredData = filteredData.filter(row => row.probability >= 0.05);
+            // Optional: Filter out very low probability results if the list is long
+            // filteredData = filteredData.filter(row => row.probability >= 0.05);
 
         } // End of probability calculation block
 
@@ -441,7 +448,6 @@ app.post('/filter', async (req, res) => {
         });
     }
 });
-
 
 // Suggestion endpoints (Unchanged, but ensure caching keys are distinct)
 app.get('/suggest-institutes', async (req, res) => {
