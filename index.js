@@ -596,7 +596,9 @@ app.get('/filter-options', async (req, res) => {
         res.status(500).json({ success: false, message: "Error fetching filter options", error: error.message });
     }
 });
-
+app.get('/', (req, res) => {
+  res.send('College Predictor API is running!');
+});
 // Global error handler (Unchanged)
 app.use((err, req, res, next) => {
     console.error("Global error:", err.stack); // Log stack trace for better debugging
