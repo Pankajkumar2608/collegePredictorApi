@@ -1,67 +1,85 @@
-// server.js
-const express = require('express');
-const { Pool } = require('pg');
-const cors = require('cors');
-require('dotenv').config();
+import express from 'express';
+import cors from 'cors';
+import pkg from 'pg';
+const { Pool } = pkg;
+import dotenv from 'dotenv';
+import { createClient } from 'redis';
 
-// --- Configuration ---
-const PORT = process.env.PORT || 3001;
-const TABLE_NAME = "csab_final"; // !!! IMPORTANT: Change this if your table name is different !!!
-const CURRENT_ACADEMIC_YEAR = new Date().getFullYear(); // Or set manually if needed
+dotenv.config();
 
-// --- Database Connection ---
-const pool = new Pool({
-  host: process.env.PGHOST,
-  database: process.env.PGDATABASE,
-  user: process.env.PGUSER,
-  password: process.env.PGPASSWORD,
-  port: 5432,
-  ssl: {
-    require: true,
-  },
-});
-
-pool.on('connect', () => console.log('Connected to the Database via Pool'));
-pool.on('error', (err) => {
-  console.error('Unexpected error on idle database client', err);
-  process.exit(-1);
-});
-
-// --- Express App Setup ---
 const app = express();
+app.use(express.json());
 app.use(cors({
     origin: ["https://www.motivationkaksha.com", "https://motivationkaksha.com", "http://127.0.0.1:5500"],
     credentials: true
 }));
-app.use(express.json());
 
-// --- Helper Functions ---
+// --- Redis Initialization ---
+const redisClient = createClient({
+    url: process.env.REDIS_URL || 'redis://localhost:6379'
+});
+redisClient.on('error', (err) => console.error('Redis Client Error', err));
+(async () => {
+    try {
+        await redisClient.connect();
+        console.log('Redis connected successfully');
+    } catch (error) {
+        console.error('Redis connection failed:', error);
+    }
+})();
 
-function calculateLowerMargin(userRank) { /* ... (keep your existing function) ... */
-    if (userRank === null || isNaN(userRank) || userRank < 1) return 0;
-    if (userRank <= 10000) return 1500;
-    if (userRank <= 20000) return 2500;
-    if (userRank <= 30000) return 3200;
-    if (userRank <= 40000) return 3900;
-    if (userRank <= 50000) return 4500;
-    if (userRank <= 60000) return 5000;
-    if (userRank <= 70000) return 5500;
-    if (userRank <= 80000) return 6000;
-    if (userRank <= 90000) return 8500;
-    if (userRank <= 100000) return 10500;
-    if (userRank <= 150000) return 12500;
-    if (userRank <= 210000) return 20000;
-    return 30000;
+// --- PostgreSQL Initialization ---
+const pool = new Pool({
+    user: process.env.PGUSER,
+    host: process.env.PGHOST,
+    database: process.env.PGDATABASE,
+    password: process.env.PGPASSWORD,
+    port: process.env.DB_PORT,
+    ssl: true, // Ensure your PG environment variables are set for SSL if required by your DB provider
+});
+
+// --- Caching Helper Functions ---
+async function cacheResponse(key, data, expirationSeconds = 3600) {
+    if (!redisClient.isReady) {
+        console.warn(`Redis not ready. Cache storage failed for key ${key}`);
+        return;
+    }
+    try {
+        await redisClient.set(key, JSON.stringify(data), { EX: expirationSeconds });
+    } catch (err) {
+        console.warn(`Cache storage failed for key ${key}:`, err.message);
+    }
 }
 
-function safeRankToIntSQL(columnName) {
-    return `NULLIF(regexp_replace("${columnName}", '[^0-9]', '', 'g'), '')::integer`;
+async function getFromCache(key) {
+    if (!redisClient.isReady) {
+        console.warn(`Redis not ready. Cache retrieval failed for key ${key}`);
+        return null;
+    }
+    try {
+        const data = await redisClient.get(key);
+        return data ? JSON.parse(data) : null;
+    } catch (err) {
+        console.warn(`Cache retrieval failed for key ${key}:`, err.message);
+        return null;
+    }
 }
 
-// --- NEW Prediction Helper Functions (Simplified from JoSAA example) ---
+// --- Probability & Analysis Helper Functions ---
+
+function calculateStandardDeviation(values) {
+    if (!values || values.length === 0) return 0;
+    const n = values.length;
+    const mean = values.reduce((a, b) => a + b, 0) / n;
+    const variance = values.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / n;
+    return Math.sqrt(variance);
+}
 
 /**
  * Calculates probability of admission based on user's rank and a target closing rank.
+ * @param {number} userRank - The user's rank.
+ * @param {number} targetRank - The target closing rank (e.g., projected closing rank).
+ * @returns {number} Probability between 0.01 and 0.99.
  */
 function getProbabilityAgainstTarget(userRank, targetRank) {
     userRank = Number(userRank);
@@ -69,351 +87,577 @@ function getProbabilityAgainstTarget(userRank, targetRank) {
 
     if (isNaN(userRank) || isNaN(targetRank) || targetRank <= 0) return 0.01;
 
-    if (userRank <= targetRank) return 0.98; // High chance if rank is better
+    if (userRank <= targetRank) {
+        return 0.98;
+    }
 
     const diff = userRank - targetRank;
-    // Simplified k_factor logic for CSAB
-    const k_factor = 0.30; // Tune this: Higher means probability drops slower
-    const k = Math.max(1000, targetRank * k_factor); // Min k to prevent over-sensitivity
+    const k_factor = 0.25; 
+    const k = Math.max(500, targetRank * k_factor);
 
-    let probability = 0.90 * Math.exp(-diff / k);
+    let probability = 0.90 * Math.exp(-diff / k); 
+
     probability = Math.max(0.01, Math.min(probability, 0.90));
     return +probability.toFixed(3);
 }
 
+
+/**
+ * Calculates prediction details including projected rank, probability, and confidence.
+ * @param {number} userRankInput - The user's rank.
+ * @param {Array} historicalCutoffs - Array of { year, closeRank, round } for the latest round of each historical year.
+ * @returns {object} Prediction details.
+ */
+function calculatePredictionDetails(userRankInput, historicalCutoffs) {
+    if (!historicalCutoffs || historicalCutoffs.length === 0) {
+        return {
+            projectedRank: null,
+            probability: 0,
+            confidence: "none",
+            message: "No historical data for projection.",
+            recommendation: getBaseRecommendation(0),
+            historicalDataForDisplay: [] 
+        };
+    }
+
+    const userRank = Number(userRankInput);
+
+    historicalCutoffs.sort((a, b) => b.year - a.year); // Most recent first
+
+    let weightedRankSum = 0;
+    let totalWeight = 0;
+    const recencyWeights = [1.0, 0.85, 0.7, 0.55, 0.4]; 
+
+    historicalCutoffs.slice(0, recencyWeights.length).forEach((data, index) => {
+        if (data.closeRank !== null && !isNaN(data.closeRank)) {
+            const weight = recencyWeights[index] || 0.3; // Fallback for very old data beyond 5 years (if slice wasn't used)
+            weightedRankSum += data.closeRank * weight;
+            totalWeight += weight;
+        }
+    });
+
+    if (totalWeight === 0) { 
+        return {
+            projectedRank: null,
+            probability: 0,
+            confidence: "very low",
+            message: "Insufficient valid historical data for projection.",
+            recommendation: getBaseRecommendation(0),
+            historicalDataForDisplay: historicalCutoffs.map(h => ({...h})) 
+        };
+    }
+    let projectedClosingRank = weightedRankSum / totalWeight;
+
+    // Trend Analysis and Adjustment
+    if (historicalCutoffs.length >= 2) {
+        const latest = historicalCutoffs[0]; 
+        const previous = historicalCutoffs[1]; 
+        if (latest.closeRank !== null && previous.closeRank !== null && previous.closeRank > 0) { // Added previous.closeRank > 0 to avoid division by zero
+            const change = latest.closeRank - previous.closeRank; 
+            const relativeChange = change / previous.closeRank;
+            const maxAdjustmentRatio = 0.10; 
+            if (Math.abs(relativeChange) > 0.03) { 
+                 let adjustment = 0;
+                 if (change < 0) { // Got harder (closing rank decreased)
+                    adjustment = projectedClosingRank * Math.max(-maxAdjustmentRatio, relativeChange * 0.5); 
+                 } else if (change > 0) { // Got easier (closing rank increased)
+                    adjustment = projectedClosingRank * Math.min(maxAdjustmentRatio, relativeChange * 0.5); 
+                 }
+                 projectedClosingRank += adjustment;
+            }
+        }
+    }
+    projectedClosingRank = Math.max(1, Math.round(projectedClosingRank)); 
+    const finalProbability = getProbabilityAgainstTarget(userRank, projectedClosingRank);
+    const historicalRanksForConfidence = historicalCutoffs.map(h => h.closeRank).filter(r => r !== null && !isNaN(r));
+    const stdDevHistRanks = calculateStandardDeviation(historicalRanksForConfidence);
+    const relativeStdDev = historicalRanksForConfidence.length > 0 && projectedClosingRank > 0 ?
+                           stdDevHistRanks / projectedClosingRank : 1; 
+
+    let confidence = "low";
+    const nPoints = historicalRanksForConfidence.length;
+
+    if (nPoints >= 4) {
+        if (relativeStdDev < 0.10) confidence = "very high";
+        else if (relativeStdDev < 0.15) confidence = "high";
+        else if (relativeStdDev < 0.25) confidence = "medium";
+        else confidence = "low";
+    } else if (nPoints === 3) {
+        if (relativeStdDev < 0.15) confidence = "high";
+        else if (relativeStdDev < 0.20) confidence = "medium";
+        else confidence = "low";
+    } else if (nPoints === 2) {
+        if (relativeStdDev < 0.20) confidence = "medium";
+        else confidence = "low";
+    } else { 
+        confidence = "very low";
+    }
+
+    const message = getRecommendationMessage(finalProbability, confidence);
+    const recommendation = getBaseRecommendation(finalProbability);
+
+    return {
+        projectedRank: projectedClosingRank,
+        probability: +(finalProbability.toFixed(2)),
+        confidence,
+        message,
+        recommendation,
+    };
+}
+
+
+function getRecommendationMessage(probability, confidence) {
+    const baseMessage = getBaseRecommendation(probability);
+    if (confidence === "none") return "No historical data to estimate probability.";
+    if (confidence === "very low") return `${baseMessage} (Prediction confidence: Very Low due to limited/inconsistent data.)`;
+    if (confidence === "low") return `${baseMessage} (Prediction confidence: Low due to data limitations.)`;
+    if (confidence === "medium") return `${baseMessage} (Prediction confidence: Medium.)`;
+    if (confidence === "high") return `${baseMessage} (Prediction confidence: High.)`;
+    if (confidence === "very high") return `${baseMessage} (Prediction confidence: Very High.)`;
+    return baseMessage;
+}
+
 function getBaseRecommendation(probability) {
-    if (probability >= 0.95) return "Excellent chance";
+    if (probability >= 0.95) return "Excellent chance"; 
     if (probability >= 0.80) return "Very good chance";
     if (probability >= 0.60) return "Good chance";
     if (probability >= 0.40) return "Reasonable chance";
     if (probability >= 0.20) return "Moderate chance";
     if (probability >= 0.10) return "Low chance";
-    return "Very low chance";
+    if (probability >= 0.05) return "Very low chance";
+    return "Extremely low chance";
 }
 
 /**
- * Calculates a simplified projected closing rank.
- * @param {Array} historicalCutoffs - Array of { year, closing_rank, round } for a specific program.
- *                                   Ensure this array is sorted by year DESC, then round DESC.
- * @returns {number|null} Projected closing rank or null if not enough data.
+ * Determines the institute type (IIT, NIT, IIIT, GFTI, UNKNOWN).
+ * Prioritizes direct type matches if 'value' is 'IIT', 'NIT', etc.
+ * Falls back to parsing 'value' as an institute name.
+ * @param {string | null | undefined} value - The value to determine type from (e.g., from "College type" column or "Institute" name).
+ * @returns {'IIT' | 'NIT' | 'IIIT' | 'GFTI' | 'UNKNOWN'}
  */
-function calculateProjectedRank(historicalCutoffs) {
-    if (!historicalCutoffs || historicalCutoffs.length === 0) return null;
+function getInstituteType(value) {
+    if (!value) return 'UNKNOWN';
+    const valStr = String(value).trim();
+    const valUpper = valStr.toUpperCase();
 
-    // Use latest round's closing rank for each year
-    const latestRanksPerYear = [];
-    const seenYears = new Set();
-    for (const cutoff of historicalCutoffs) { // Assumes historicalCutoffs is sorted year DESC, round DESC
-        if (cutoff.closing_rank !== null && !isNaN(cutoff.closing_rank) && !seenYears.has(cutoff.year)) {
-            latestRanksPerYear.push({ year: cutoff.year, rank: cutoff.closing_rank });
-            seenYears.add(cutoff.year);
-        }
-        if (latestRanksPerYear.length >= 3) break; // Consider up to last 3 available years for projection
-    }
+    // Check for direct type matches (e.g., if 'value' is 'IIT', 'NIT', from "College type" column)
+    if (valUpper === 'IIT') return 'IIT';
+    if (valUpper === 'NIT') return 'NIT';
+    if (valUpper === 'IIIT') return 'IIIT';
+    if (valUpper === 'GFTI') return 'GFTI';
 
-    if (latestRanksPerYear.length === 0) return null;
-
-    // Simplified weighted average (more weight to recent years)
-    let weightedRankSum = 0;
-    let totalWeight = 0;
-    const recencyWeights = [1.0, 0.7, 0.4]; // Weights for last 3 years
-
-    latestRanksPerYear.slice(0, recencyWeights.length).forEach((data, index) => {
-        const weight = recencyWeights[index];
-        weightedRankSum += data.rank * weight;
-        totalWeight += weight;
-    });
-
-    return totalWeight > 0 ? Math.round(weightedRankSum / totalWeight) : null;
+    // If not a direct type, parse as an institute name (original logic)
+    const nameLower = valStr.toLowerCase();
+    if (nameLower.includes('indian institute of technology') || nameLower.startsWith('iit')) return 'IIT';
+    if (nameLower.includes('national institute of technology') || nameLower.includes('iiest, shibpur') || nameLower.startsWith('nit')) return 'NIT';
+    if (nameLower.includes('indian institute of information technology') || nameLower.startsWith('iiit')) return 'IIIT';
+    
+    // Default for JoSAA context if not identified as IIT/NIT/IIIT by name or direct type
+    // If the value was from "College type" and didn't match the shorts, it's likely a GFTI or needs specific parsing
+    // If the value was from "Institute" name and didn't match IIT/NIT/IIIT patterns, it's likely a GFTI.
+    return 'GFTI'; 
 }
 
 
-// --- API Routes ---
-
-app.get('/api/options', async (req, res) => { /* ... (keep your existing options endpoint) ... */
-    const types = req.query.types ? req.query.types.split(',') : [];
-    const optionsData = {};
-    const validTypes = {
-        years: '"Year"',
-        rounds: '"Round"',
-        quotas: '"Quota"',
-        seatTypes: '"Seat Type"',
-        genders: '"Gender"',
-        institutes: '"Institute"',
-        programs: '"Academic Program Name"'
-    };
-
+// --- Endpoints ---
+app.get('/health', async (req, res) => {
     try {
-        const client = await pool.connect();
-        try {
-            const promises = types.map(async (type) => {
-                const columnName = validTypes[type];
-                if (!columnName) return;
-
-                const queryText = `SELECT DISTINCT ${columnName} FROM "${TABLE_NAME}" WHERE ${columnName} IS NOT NULL AND ${columnName}::text <> '' ORDER BY ${columnName} ASC`;
-                const result = await client.query(queryText);
-                optionsData[type] = result.rows.map(row => row[Object.keys(row)[0]]);
-
-                if (type === 'years') {
-                    optionsData[type].sort((a, b) => parseInt(b, 10) - parseInt(a, 10));
-                }
-                 if (type === 'rounds') {
-                    optionsData[type].sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
-                }
-            });
-            await Promise.all(promises);
-            res.json(optionsData);
-        } finally {
-            client.release();
-        }
-    } catch (err) {
-        console.error("Error fetching dropdown options:", err);
-        res.status(500).json({ message: "Error fetching filter options." });
+        const dbResult = await pool.query('SELECT NOW()');
+        res.status(200).json({
+            success: true,
+            database: "connected",
+            redis: redisClient.isReady ? "connected" : "disconnected",
+            timestamp: dbResult.rows[0].now
+        });
+    } catch (error) {
+        console.error("Health check error:", error);
+        res.status(500).json({
+            success: false,
+            database: "disconnected",
+            redis: redisClient.isReady ? "connected" : "disconnected",
+            error: error.message
+        });
     }
 });
 
-app.get('/api/colleges', async (req, res) => {
+app.post('/filter', async (req, res) => {
     const {
-        rank, seatType, year: selectedYear, round: selectedRound, quota, gender, institute, program,
-        page = 1, limit = 25, fetchAll = 'false'
-    } = req.query;
+        institute, AcademicProgramName, quota, SeatType, gender,
+        userRank, Year, round, instituteType // instituteType is from request body
+    } = req.body;
 
-    if (!seatType) {
-        return res.status(400).json({ message: "Seat Type (Category) is required." });
+    let userRankInt = null;
+    if (userRank !== undefined && userRank !== null && String(userRank).trim() !== '') {
+        if (!/^\d+$/.test(userRank) || parseInt(userRank, 10) <= 0) {
+            return res.status(400).json({ success: false, message: "User rank must be a positive integer." });
+        }
+        userRankInt = parseInt(userRank, 10);
     }
-    const userRank = rank ? parseInt(rank, 10) : null;
-    if (rank && (isNaN(userRank) || userRank < 1)) {
-        return res.status(400).json({ message: "Invalid Rank provided." });
-    }
-    const currentPage = parseInt(page, 10) || 1;
-    const itemsPerPage = parseInt(limit, 10) || 25;
-    const offset = (currentPage - 1) * itemsPerPage;
-    const shouldFetchAll = fetchAll === 'true';
 
-    let client;
+    let effectiveYear = (Year !== undefined && Year !== null && String(Year).trim() !== '') ? parseInt(Year, 10) : null;
+    let effectiveRound = (round !== undefined && round !== null && String(round).trim() !== '') ? parseInt(round, 10) : null;
+
     try {
-        client = await pool.connect();
-
-        // --- Stage 1: Initial Filtering (mostly based on latest year if not specified) ---
-        let initialFilterParams = [];
-        let initialParamIndex = 1;
-        let initialWhereClauses = [`"Seat Type" = $${initialParamIndex++}`];
-        initialFilterParams.push(seatType);
-
-        let effectiveYear = selectedYear ? parseInt(selectedYear, 10) : null;
-        let effectiveRound = selectedRound ? parseInt(selectedRound, 10) : null;
-
-        // Determine latest year/round if not provided
-        if (!effectiveYear) {
-            const latestYearResult = await client.query(`SELECT MAX("Year") as max_year FROM "${TABLE_NAME}"`);
-            if (latestYearResult.rows.length > 0 && latestYearResult.rows[0].max_year) {
+        if (effectiveYear === null) {
+            const latestYearResult = await pool.query(`SELECT MAX("Year") as max_year FROM public.combined_josaa_in`);
+            if (latestYearResult.rows.length > 0 && latestYearResult.rows[0].max_year !== null) {
                 effectiveYear = parseInt(latestYearResult.rows[0].max_year, 10);
             }
         }
-        if (effectiveYear && !effectiveRound) {
-            const latestRoundResult = await client.query(`SELECT MAX("Round") as max_round FROM "${TABLE_NAME}" WHERE "Year" = $1`, [effectiveYear]);
-            if (latestRoundResult.rows.length > 0 && latestRoundResult.rows[0].max_round) {
+        if (effectiveRound === null && effectiveYear !== null) {
+            const latestRoundResult = await pool.query(
+                `SELECT MAX("Round") as max_round FROM public.combined_josaa_in WHERE "Year" = $1`, [effectiveYear]
+            );
+            if (latestRoundResult.rows.length > 0 && latestRoundResult.rows[0].max_round !== null) {
                 effectiveRound = parseInt(latestRoundResult.rows[0].max_round, 10);
             }
         }
+
+        const actualFiltersForCache = {
+            institute, AcademicProgramName, quota, SeatType, gender,
+            userRank: userRankInt, Year: effectiveYear, round: effectiveRound, instituteType
+        };
+        const cacheKey = `filter:v8_collegetype:${JSON.stringify(actualFiltersForCache)}`;
+
+        const cachedData = await getFromCache(cacheKey);
+        if (cachedData) {
+            console.log('Serving filter results from cache (v8_collegetype) for key:', cacheKey);
+            return res.status(200).json(cachedData);
+        }
+
+        let filterQuery = `
+            SELECT
+                "Institute", "Academic Program Name", "Quota", "Seat Type", "Gender",
+                "Year", "Round", "College type", -- Added "College type" column
+                NULLIF("Opening Rank", '')::INTEGER AS "Opening Rank",
+                NULLIF("Closing Rank", '')::INTEGER AS "Closing Rank"
+        `;
+        if (userRankInt) {
+            filterQuery += `, ABS(NULLIF("Closing Rank", '')::INTEGER - $1) AS rank_diff`;
+        }
+        filterQuery += ` FROM public.combined_josaa_in WHERE 1=1 `;
         
-        // Add year and round to initial filter if determined/selected
-        if (effectiveYear) { initialWhereClauses.push(`"Year" = $${initialParamIndex++}`); initialFilterParams.push(effectiveYear); }
-        if (effectiveRound) { initialWhereClauses.push(`"Round" = $${initialParamIndex++}`); initialFilterParams.push(effectiveRound); }
-
-
-        if (quota) { initialWhereClauses.push(`"Quota" = $${initialParamIndex++}`); initialFilterParams.push(quota); }
-        if (gender) { initialWhereClauses.push(`"Gender" = $${initialParamIndex++}`); initialFilterParams.push(gender); }
-        if (institute) { initialWhereClauses.push(`"Institute" = $${initialParamIndex++}`); initialFilterParams.push(institute); }
-        if (program) {
-            initialWhereClauses.push(`"Academic Program Name" ILIKE $${initialParamIndex++}`);
-            initialFilterParams.push(`%${program}%`);
-        }
-
-        const specificInstituteSelected = !!institute;
-        if (userRank && !specificInstituteSelected) {
-            const lowerMargin = calculateLowerMargin(userRank);
-            const minAllowedRank = Math.max(1, userRank - lowerMargin);
-            // This rank filter is a bit broad initially, projection will refine
-            initialWhereClauses.push(`${safeRankToIntSQL("Closing Rank")} >= $${initialParamIndex++}`);
-            initialFilterParams.push(minAllowedRank - 5000); // Widen a bit more for initial fetch
-            initialWhereClauses.push(`${safeRankToIntSQL("Closing Rank")} <= $${initialParamIndex++}`);
-            initialFilterParams.push(userRank + 2 * calculateLowerMargin(userRank)); // And widen on the upper end too
-        }
-        initialWhereClauses.push(`${safeRankToIntSQL("Closing Rank")} IS NOT NULL`); // Ensure closing rank exists
-
-        const initialWhereString = `WHERE ${initialWhereClauses.join(" AND ")}`;
-        const initialSelect = `
-            SELECT DISTINCT "Institute", "Academic Program Name", "Quota", "Seat Type", "Gender",
-                   MAX("Year") as "Year", MAX("Round") as "Round", -- Get latest year/round for this distinct group
-                   ${safeRankToIntSQL("Opening Rank")} as opening_rank,
-                   ${safeRankToIntSQL("Closing Rank")} as closing_rank 
-            FROM "${TABLE_NAME}"
-            ${initialWhereString}
-            GROUP BY "Institute", "Academic Program Name", "Quota", "Seat Type", "Gender", opening_rank, closing_rank 
-            LIMIT 500`; // Limit initial candidates for performance
+        const params = [];
+        let paramIndex = 1;
+        if (userRankInt) { params.push(userRankInt); paramIndex++; }
+        if (effectiveYear !== null) { filterQuery += ` AND "Year" = $${paramIndex++}`; params.push(effectiveYear); }
+        if (effectiveRound !== null) { filterQuery += ` AND "Round" = $${paramIndex++}`; params.push(effectiveRound); }
         
-        const initialResults = await client.query(initialSelect, initialFilterParams);
-        let candidates = initialResults.rows.map(row => ({
-            ...row,
-            program_name: row["Academic Program Name"], // Alias for consistency
-            seat_type: row["Seat Type"], // Alias
-        }));
-
-        if (candidates.length === 0) {
-            return res.json({ results: [], totalCount: 0, currentPage: 1, totalPages: 1 });
-        }
-
-        // --- Stage 2: Fetch Historical Data for Projection (if userRank is provided) ---
-        let processedResults = [];
-        if (userRank) {
-            const historicalDataPromises = candidates.map(async (candidate) => {
-                const historyQuery = `
-                    SELECT "Year" as year, "Round" as round, ${safeRankToIntSQL("Closing Rank")} as closing_rank
-                    FROM "${TABLE_NAME}"
-                    WHERE "Institute" = $1 AND "Academic Program Name" = $2 AND "Quota" = $3
-                      AND "Seat Type" = $4 AND "Gender" = $5 AND ${safeRankToIntSQL("Closing Rank")} IS NOT NULL
-                    ORDER BY "Year" DESC, "Round" DESC
-                `;
-                const historyParams = [candidate.Institute, candidate["Academic Program Name"], candidate.Quota, candidate["Seat Type"], candidate.Gender];
-                const historyResult = await client.query(historyQuery, historyParams);
-
-                const projectedRank = calculateProjectedRank(historyResult.rows);
-                let probability = 0;
-                let recommendation = getBaseRecommendation(0);
-
-                if (projectedRank !== null) {
-                    probability = getProbabilityAgainstTarget(userRank, projectedRank);
-                    recommendation = getBaseRecommendation(probability);
-                } else {
-                    // Fallback to using current year's closing rank if no projection possible
-                    if (candidate.closing_rank !== null) {
-                        probability = getProbabilityAgainstTarget(userRank, candidate.closing_rank);
-                        recommendation = getBaseRecommendation(probability);
-                    }
-                }
-                
-                return {
-                    ...candidate,
-                    projected_rank: projectedRank,
-                    probability: probability,
-                    recommendation: recommendation,
-                    // Use the closing_rank from the initial query (latest year/round selected) for display
-                    // The 'closing_rank' in candidate is already the one from the specified/latest year/round
-                };
-            });
-            processedResults = await Promise.all(historicalDataPromises);
-
-            // --- Stage 3: Sort Processed Results ---
-            processedResults.sort((a, b) => {
-                // Primary sort: Probability (descending)
-                if (b.probability !== a.probability) {
-                    return b.probability - a.probability;
-                }
-                // Secondary sort: User rank vs Projected rank
-                // Prefer colleges where user_rank <= projected_rank
-                const a_isSafer = userRank <= (a.projected_rank || a.closing_rank || Infinity);
-                const b_isSafer = userRank <= (b.projected_rank || b.closing_rank || Infinity);
-
-                if (a_isSafer && !b_isSafer) return -1;
-                if (!a_isSafer && b_isSafer) return 1;
-
-                // If both are "safer" or "riskier", sort by how close the projected/actual rank is
-                const diffA = Math.abs((a.projected_rank || a.closing_rank || Infinity) - userRank);
-                const diffB = Math.abs((b.projected_rank || b.closing_rank || Infinity) - userRank);
-                if (diffA !== diffB) {
-                    return diffA - diffB; // Smaller difference first
-                }
-                
-                // Fallback sorting
-                if (a.Institute.localeCompare(b.Institute) !== 0) {
-                    return a.Institute.localeCompare(b.Institute);
-                }
-                return a.program_name.localeCompare(b.program_name);
-            });
-
-        } else { // No user rank, just sort by institute and program
-            processedResults = candidates.sort((a, b) => {
-                if (a.Institute.localeCompare(b.Institute) !== 0) {
-                    return a.Institute.localeCompare(b.Institute);
-                }
-                if (a.program_name.localeCompare(b.program_name) !== 0) {
-                    return a.program_name.localeCompare(b.program_name);
-                }
-                return (a.closing_rank || Infinity) - (b.closing_rank || Infinity);
-            });
+        // Institute Type Filter - USES "College type" COLUMN
+        // Assumes instituteType from request is 'iit', 'nit', etc. and DB stores 'IIT', 'NIT', etc.
+        if (instituteType && String(instituteType).toLowerCase() !== 'all') {
+            filterQuery += ` AND "College type" ILIKE $${paramIndex++}`;
+            params.push(instituteType); 
         }
         
-        // --- Stage 4: Pagination ---
-        const totalCount = processedResults.length;
-        const paginatedResults = shouldFetchAll ? processedResults : processedResults.slice(offset, offset + itemsPerPage);
-
-        const finalResultsWithId = paginatedResults.map(row => ({
-            id: `${row.Institute}-${row.program_name}-${row.Quota}-${row.seat_type}-${row.Gender}-${row.Year}-${row.Round}`.toLowerCase().replace(/[^a-z0-9\-_]/g, "-").replace(/-+/g,'-').replace(/^-+|-+$/g, ''),
-            ...row
-        }));
-
-        res.json({
-            results: finalResultsWithId,
-            totalCount: totalCount,
-            currentPage: shouldFetchAll ? 1 : currentPage,
-            totalPages: shouldFetchAll ? 1 : Math.ceil(totalCount / itemsPerPage),
-            appliedFilters: { // Send back what was effectively used
-                seatType, effectiveYear, effectiveRound, quota, gender, institute, program, userRank
+        const otherFiltersConfig = [
+            { column: "Institute", value: institute, isLike: true },
+            { column: "Academic Program Name", value: AcademicProgramName, isLike: true },
+            { column: "Quota", value: quota }, { column: "Seat Type", value: SeatType }, { column: "Gender", value: gender },
+        ];
+        otherFiltersConfig.forEach(f => {
+            if (f.value) {
+                if (f.isLike) { filterQuery += ` AND "${f.column}" ILIKE $${paramIndex++}`; params.push(`%${f.value}%`); }
+                else { filterQuery += ` AND "${f.column}" = $${paramIndex++}`; params.push(f.value); }
             }
         });
 
-    } catch (err) {
-        console.error("Database Query Error in /api/colleges:", err);
-        res.status(500).json({ message: "Error fetching college data." });
-    } finally {
-        if (client) client.release();
+        if (userRankInt) {
+            filterQuery += ` AND NULLIF("Closing Rank", '') IS NOT NULL AND NULLIF("Closing Rank", '')::INTEGER > 0`;
+            filterQuery += ` ORDER BY rank_diff ASC, "Year" DESC, "Round" DESC`; 
+        } else {
+            filterQuery += ` ORDER BY "Institute" ASC, "Academic Program Name" ASC, "Year" DESC, "Round" DESC, COALESCE(NULLIF("Closing Rank", '')::INTEGER, 9999999) ASC`;
+        }
+        filterQuery += ` LIMIT 750;`; 
+
+        const initialResult = await pool.query(filterQuery, params);
+        let filteredData = initialResult.rows;
+
+        if (userRankInt && filteredData.length > 0) {
+            const programMapForHistory = new Map();
+            filteredData.forEach(row => { 
+                const key = `${row.Institute}|${row["Academic Program Name"]}|${row.Quota}|${row["Seat Type"]}|${row.Gender}`;
+                if (!programMapForHistory.has(key)) {
+                    programMapForHistory.set(key, { Institute: row.Institute, "Academic Program Name": row["Academic Program Name"], Quota: row.Quota, "Seat Type": row["Seat Type"], Gender: row.Gender });
+                }
+            });
+
+            if (programMapForHistory.size > 0) {
+                const historicalQueryValues = Array.from(programMapForHistory.keys()).map((_, i) => `($${i*5+1}, $${i*5+2}, $${i*5+3}, $${i*5+4}, $${i*5+5})`).join(', ');
+                let historicalQuery = `
+                    SELECT "Institute", "Academic Program Name", "Quota", "Seat Type", "Gender",
+                           "Year", "Round", NULLIF("Closing Rank", '')::INTEGER AS "Closing Rank"
+                    FROM public.combined_josaa_in
+                    WHERE ("Institute", "Academic Program Name", "Quota", "Seat Type", "Gender")
+                    IN (VALUES ${historicalQueryValues})
+                    ORDER BY "Institute", "Academic Program Name", "Quota", "Seat Type", "Gender", "Year" DESC, "Round" DESC;
+                `;
+                const historicalParams = Array.from(programMapForHistory.values()).flatMap(p => [p.Institute, p["Academic Program Name"], p.Quota, p["Seat Type"], p.Gender]);
+                const historicalResult = await pool.query(historicalQuery, historicalParams);
+
+                const historicalDataGrouped = {}; 
+                historicalResult.rows.forEach(row => {
+                    const key = `${row.Institute}|${row["Academic Program Name"]}|${row.Quota}|${row["Seat Type"]}|${row.Gender}`;
+                    if (!historicalDataGrouped[key]) historicalDataGrouped[key] = [];
+                    historicalDataGrouped[key].push({ year: row.Year, round: row.Round, closeRank: row["Closing Rank"] });
+                });
+
+                filteredData = filteredData.map(row => {
+                    const key = `${row.Institute}|${row["Academic Program Name"]}|${row.Quota}|${row["Seat Type"]}|${row.Gender}`;
+                    const fullHistoryForProgram = historicalDataGrouped[key] || [];
+                    
+                    const latestRoundCutoffsPerYear = [];
+                    const seenYears = new Set();
+                    fullHistoryForProgram.sort((a, b) => { 
+                        if (b.year !== a.year) return b.year - a.year;
+                        return b.round - a.round;
+                    });
+
+                    for (const histItem of fullHistoryForProgram) {
+                        if (histItem.closeRank !== null && !isNaN(histItem.closeRank) && !seenYears.has(histItem.year)) {
+                            latestRoundCutoffsPerYear.push(histItem);
+                            seenYears.add(histItem.year);
+                        }
+                    }
+                    
+                    const predictionOutput = calculatePredictionDetails(userRankInt, latestRoundCutoffsPerYear);
+                    // Determine instituteCategory using "College type" first, then fallback to Institute name
+                    const instituteCategory = getInstituteType(row["College type"] || row.Institute);
+                    
+                    return {
+                        ...row, 
+                        ...predictionOutput, 
+                        instituteCategory,
+                        historicalDataForDisplay: latestRoundCutoffsPerYear.sort((a,b) => b.year - a.year) 
+                    };
+                });
+
+                const typeOrder = { 'IIT': 1, 'NIT': 2, 'IIIT': 3, 'GFTI': 4, 'UNKNOWN': 5 };
+                filteredData.sort((a, b) => {
+                    const typeAOrder = typeOrder[a.instituteCategory] || typeOrder['UNKNOWN'];
+                    const typeBOrder = typeOrder[b.instituteCategory] || typeOrder['UNKNOWN'];
+                    if (typeAOrder !== typeBOrder) return typeAOrder - typeBOrder;
+
+                    const probDiff = b.probability - a.probability;
+                    if (Math.abs(probDiff) > 0.001) return probDiff;
+
+                    const ur = userRankInt;
+                    const crA = a["Closing Rank"] === null || isNaN(Number(a["Closing Rank"])) ? Infinity : Number(a["Closing Rank"]);
+                    const crB = b["Closing Rank"] === null || isNaN(Number(b["Closing Rank"])) ? Infinity : Number(b["Closing Rank"]);
+                    const projRankA = a.projectedRank !== null && !isNaN(a.projectedRank) ? a.projectedRank : crA;
+                    const projRankB = b.projectedRank !== null && !isNaN(b.projectedRank) ? b.projectedRank : crB;
+
+                    const userIsBetterOrEqualA_Proj = ur <= projRankA;
+                    const userIsBetterOrEqualB_Proj = ur <= projRankB;
+
+                    if (userIsBetterOrEqualA_Proj && userIsBetterOrEqualB_Proj) {
+                        if (projRankA !== projRankB) return projRankA - projRankB; 
+                        return crA - crB; 
+                    } else if (userIsBetterOrEqualA_Proj && !userIsBetterOrEqualB_Proj) {
+                        return -1;
+                    } else if (!userIsBetterOrEqualA_Proj && userIsBetterOrEqualB_Proj) {
+                        return 1;
+                    } else { 
+                        const rankDiffA_Proj = Math.abs(projRankA - ur);
+                        const rankDiffB_Proj = Math.abs(projRankB - ur);
+                        if (rankDiffA_Proj !== rankDiffB_Proj) return rankDiffA_Proj - rankDiffB_Proj;
+                        
+                        const actualRankDiffA = a.rank_diff !== undefined ? a.rank_diff : Math.abs(crA - ur);
+                        const actualRankDiffB = b.rank_diff !== undefined ? b.rank_diff : Math.abs(crB - ur);
+                        if(actualRankDiffA !== actualRankDiffB) return actualRankDiffA - actualRankDiffB;
+                        return crA - crB; 
+                    }
+                });
+            }
+        } else if (filteredData.length > 0) { // No user rank, but data exists
+            filteredData.forEach(row => {
+                row.instituteCategory = getInstituteType(row["College type"] || row.Institute);
+            });
+             // Sort by institute type even when no user rank
+            const typeOrder = { 'IIT': 1, 'NIT': 2, 'IIIT': 3, 'GFTI': 4, 'UNKNOWN': 5 };
+            filteredData.sort((a,b) => {
+                const typeAOrder = typeOrder[a.instituteCategory] || typeOrder['UNKNOWN'];
+                const typeBOrder = typeOrder[b.instituteCategory] || typeOrder['UNKNOWN'];
+                if (typeAOrder !== typeBOrder) return typeAOrder - typeBOrder;
+                if ((a.Institute || "").localeCompare(b.Institute || "") !== 0) {
+                     return (a.Institute || "").localeCompare(b.Institute || "");
+                }
+                return (a["Academic Program Name"] || "").localeCompare(b["Academic Program Name"] || "");
+            });
+        }
+
+        const responseData = {
+            success: true, count: filteredData.length,
+            message: filteredData.length === 0 ? "No matches found." : (userRankInt ? "Results with prediction." : "Filtered results."),
+            filterData: filteredData, appliedFilters: actualFiltersForCache
+        };
+        await cacheResponse(cacheKey, responseData, userRankInt ? 1800 : 3600);
+        res.status(200).json(responseData);
+
+    } catch (error) {
+        console.error("Filter endpoint error:", error);
+        res.status(500).json({ success: false, message: "Error processing filter data.", error: error.message });
     }
 });
 
 
-app.get('/api/trends', async (req, res) => { /* ... (keep your existing trends endpoint) ... */
-    const { institute, program, quota, seatType, gender, round } = req.query;
-
-    if (!institute || !program || !quota || !seatType || !gender || !round) {
-        return res.status(400).json({ message: "Missing required parameters for trend data." });
-    }
-
-    const queryText = `
-        SELECT "Year" as year, ${safeRankToIntSQL("Opening Rank")} as opening_rank, ${safeRankToIntSQL("Closing Rank")} as closing_rank
-        FROM "${TABLE_NAME}"
-        WHERE "Institute" = $1
-          AND "Academic Program Name" = $2
-          AND "Quota" = $3
-          AND "Seat Type" = $4
-          AND "Gender" = $5
-          AND "Round" = $6 
-          AND ${safeRankToIntSQL("Closing Rank")} IS NOT NULL
-        ORDER BY "Year" ASC
-    `;
-    const queryParams = [institute, program, quota, seatType, gender, parseInt(round, 10)];
+app.get('/suggest-institutes', async (req, res) => {
+    const { term, type } = req.query;
+    const cacheKey = `suggest-institutes:v3_collegetype:${term?.toLowerCase() || 'all'}:${type?.toLowerCase() || 'all'}`;
 
     try {
-        const client = await pool.connect();
-        try {
-            const result = await client.query(queryText, queryParams);
-            res.json(result.rows);
-        } finally {
-            client.release();
+        const cachedData = await getFromCache(cacheKey);
+        if (cachedData) return res.json(cachedData);
+
+        let query = `SELECT DISTINCT "Institute" FROM public.combined_josaa_in WHERE 1=1 `;
+        const params = [];
+        let paramIndex = 1;
+
+        if (term && term.trim() !== '') {
+            query += ` AND "Institute" ILIKE $${paramIndex++}`;
+            params.push(`%${term}%`);
         }
-    } catch (err) {
-        console.error("Error fetching trend data:", err);
-        res.status(500).json({ message: "Error fetching trend data." });
+        
+        // Filter by "College type" column. Assumes 'type' from query is 'iit', 'nit', etc.
+        // and DB stores 'IIT', 'NIT', etc. in "College type".
+        if (type && type.toLowerCase() !== 'all') {
+            const instType = type.toLowerCase(); 
+            query += ` AND "College type" ILIKE $${paramIndex++}`;
+            params.push(instType); 
+        }
+
+        query += ` ORDER BY "Institute" ASC LIMIT 20;`;
+        const result = await pool.query(query, params);
+        const suggestions = result.rows.map(r => r.Institute);
+
+        await cacheResponse(cacheKey, suggestions, 3600);
+        res.json(suggestions);
+    } catch (error) {
+        console.error("Institute suggestion error:", error);
+        res.status(500).json({ success: false, message: "Error fetching suggestions", error: error.message });
     }
 });
 
-app.get('/', (req, res) => res.send('College Predictor API is running!'));
+app.get('/suggest-programs', async (req, res) => { 
+    const { term } = req.query;
+     if (!term || term.trim() === '') {
+         return res.status(400).json({ success: false, message: "Search term required" });
+     }
+    const cacheKey = `suggest-programs:v2:${term.toLowerCase()}`;
+
+    try {
+        const cachedData = await getFromCache(cacheKey);
+        if (cachedData) return res.json(cachedData);
+
+        const query = `
+            SELECT DISTINCT "Academic Program Name" as program
+            FROM public.combined_josaa_in
+            WHERE "Academic Program Name" ILIKE $1
+            ORDER BY "Academic Program Name" ASC
+            LIMIT 15; 
+        `;
+        const result = await pool.query(query, [`%${term}%`]);
+        const programs = result.rows.map(r => r.program);
+
+        await cacheResponse(cacheKey, programs, 3600);
+        res.json(programs);
+    } catch (error) {
+        console.error("Program suggestion error:", error);
+        res.status(500).json({ success: false, message: "Error fetching program suggestions", error: error.message });
+    }
+});
+
+app.post('/rank-trends', async (req, res) => { 
+    const { institute, program, SeatType, quota, gender } = req.body;
+
+    if (!institute || !program || !SeatType || !quota || !gender) {
+        return res.status(400).json({
+            success: false,
+            message: "Please provide Institute, Program Name, Seat Type, Quota, and Gender for rank trends."
+        });
+    }
+    const cacheKey = `rank-trends:v3:${JSON.stringify(req.body)}`;
+    try {
+        const cachedData = await getFromCache(cacheKey);
+        if (cachedData) return res.status(200).json(cachedData);
+
+        const query = `
+            SELECT "Year", "Round", NULLIF("Opening Rank", '')::INTEGER AS "Opening Rank", NULLIF("Closing Rank", '')::INTEGER AS "Closing Rank"
+            FROM public.combined_josaa_in
+            WHERE "Institute" = $1 AND "Academic Program Name" = $2 AND "Seat Type" = $3 AND "Quota" = $4 AND "Gender" = $5
+            ORDER BY "Year" ASC, "Round" ASC;
+        `;
+        const params = [institute, program, SeatType, quota, gender];
+        const result = await pool.query(query, params);
+        
+        const trendsByYear = {};
+        result.rows.forEach(row => {
+            if (row["Closing Rank"] !== null && !isNaN(row["Closing Rank"])){ // Only consider valid closing ranks
+                if (!trendsByYear[row.Year] || row.Round > trendsByYear[row.Year].Round) { // Get latest round for each year
+                    trendsByYear[row.Year] = row;
+                }
+            }
+        });
+        const finalData = Object.values(trendsByYear).sort((a,b) => a.Year - b.Year);
+
+        const responseData = {
+            success: true,
+            message: finalData.length === 0 ? "No trend data found for the specified criteria." : "Trend data fetched.",
+            data: finalData
+        };
+        await cacheResponse(cacheKey, responseData, 3600);
+        res.status(200).json(responseData);
+    } catch (error) {
+        console.error("Rank trends error:", error);
+        res.status(500).json({ success: false, message: "Error fetching rank trends", error: error.message });
+    }
+});
+
+app.get('/filter-options', async (req, res) => { 
+    const cacheKey = 'filter-options:v4'; // Version bump if institute types are now dynamic
+    try {
+        const cachedData = await getFromCache(cacheKey);
+        if (cachedData) return res.status(200).json(cachedData);
+
+        const [yearsResult, quotasResult, seatTypesResult, gendersResult, roundsResult, collegeTypesResult] = await Promise.all([
+            pool.query('SELECT DISTINCT "Year" FROM public.combined_josaa_in ORDER BY "Year" DESC'),
+            pool.query('SELECT DISTINCT "Quota" FROM public.combined_josaa_in WHERE "Quota" IS NOT NULL ORDER BY "Quota" ASC'),
+            pool.query('SELECT DISTINCT "Seat Type" FROM public.combined_josaa_in WHERE "Seat Type" IS NOT NULL ORDER BY "Seat Type" ASC'),
+            pool.query('SELECT DISTINCT "Gender" FROM public.combined_josaa_in WHERE "Gender" IS NOT NULL ORDER BY "Gender" ASC'),
+            pool.query('SELECT DISTINCT "Round" FROM public.combined_josaa_in ORDER BY "Round" ASC'),
+            pool.query('SELECT DISTINCT "College type" FROM public.combined_josaa_in WHERE "College type" IS NOT NULL AND "College type" <> \'\' ORDER BY "College type" ASC'),
+        ]);
+        const options = {
+            years: yearsResult.rows.map(row => row.Year),
+            quotas: quotasResult.rows.map(row => row.Quota),
+            seatTypes: seatTypesResult.rows.map(row => row["Seat Type"]),
+            genders: gendersResult.rows.map(row => row.Gender),
+            rounds: roundsResult.rows.map(row => row.Round),
+            instituteTypes: collegeTypesResult.rows.map(row => row["College type"]) // Dynamically fetch institute types
+        };
+        // Add "all" option for institute types if needed by frontend
+        if (!options.instituteTypes.map(it => it.toLowerCase()).includes('all')) {
+            options.instituteTypes.unshift('All'); // Or however your frontend expects it
+        }
+
+        await cacheResponse(cacheKey, options, 86400); // Cache for a day
+        res.status(200).json(options);
+    } catch (error) {
+        console.error("Filter options error:", error);
+        res.status(500).json({ success: false, message: "Error fetching filter options", error: error.message });
+    }
+});
+
+app.get('/', (req, res) => { res.send('College Predictor API is running!'); });
 
 app.use((err, req, res, next) => {
-  console.error("Unhandled Error:", err.stack || err);
-  res.status(500).json({ message: err.message || 'Something went wrong on the server!' });
+    console.error("Global error:", err.stack);
+    res.status(500).json({
+        success: false,
+        message: "An unexpected server error.",
+        error: process.env.NODE_ENV === 'production' ? 'Internal Server Error' : err.message
+    });
 });
 
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => { console.log(`Server started on port ${PORT}`); });
