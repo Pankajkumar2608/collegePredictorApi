@@ -75,66 +75,32 @@ function calculateStandardDeviation(values) {
     return Math.sqrt(variance);
 }
 
-/**
- * Calculates probability of admission based on user's rank and a target closing rank.
- * @param {number} userRank - The user's rank.
- * @param {number} targetRank - The target closing rank (e.g., projected closing rank).
- * @returns {number} Probability between 0.01 and 0.99.
- */
 function getProbabilityAgainstTarget(userRank, targetRank) {
     userRank = Number(userRank);
     targetRank = Number(targetRank);
-
     if (isNaN(userRank) || isNaN(targetRank) || targetRank <= 0) return 0.01;
-
-    // If user's rank is better than or equal to the target closing rank, high probability.
-    if (userRank <= targetRank) {
-        return 0.98; // High fixed probability
-    }
-
-    // If user's rank is worse than the target closing rank.
-    const diff = userRank - targetRank; // Positive difference
-    
-    // k_factor determines how quickly probability drops. Smaller k_factor -> faster drop.
-    // Larger targetRanks should have a larger k (more buffer).
+    if (userRank <= targetRank) return 0.98;
+    const diff = userRank - targetRank;
     const k_factor = 0.25; 
-    const k = Math.max(500, targetRank * k_factor); // k is influenced by targetRank, min 500.
-
-    // Exponential decay for probability. Max probability here is 0.90.
+    const k = Math.max(500, targetRank * k_factor);
     let probability = 0.90 * Math.exp(-diff / k); 
-
-    // Clamp probability between 0.01 and 0.90 for this case.
     probability = Math.max(0.01, Math.min(probability, 0.90));
-    return +probability.toFixed(3); // Return as number with 3 decimal places
+    return +probability.toFixed(3);
 }
 
-
-/**
- * Calculates prediction details including projected rank, probability, and confidence.
- * @param {number} userRankInput - The user's rank.
- * @param {Array} historicalCutoffs - Array of { year, closeRank, round } for the latest round of each historical year.
- * @returns {object} Prediction details.
- */
 function calculatePredictionDetails(userRankInput, historicalCutoffs) {
     if (!historicalCutoffs || historicalCutoffs.length === 0) {
         return {
-            projectedRank: null,
-            probability: 0,
-            confidence: "none",
-            message: "No historical data for projection.",
-            recommendation: getBaseRecommendation(0),
+            projectedRank: null, probability: 0, confidence: "none",
+            message: "No historical data for projection.", recommendation: getBaseRecommendation(0),
             historicalDataForDisplay: [] 
         };
     }
-
     const userRank = Number(userRankInput);
-
-    historicalCutoffs.sort((a, b) => b.year - a.year); // Most recent first
-
+    historicalCutoffs.sort((a, b) => b.year - a.year);
     let weightedRankSum = 0;
     let totalWeight = 0;
     const recencyWeights = [1.0, 0.85, 0.7, 0.55, 0.4]; 
-
     historicalCutoffs.slice(0, recencyWeights.length).forEach((data, index) => {
         if (data.closeRank !== null && !isNaN(data.closeRank)) {
             const weight = recencyWeights[index] || 0.3; 
@@ -142,19 +108,14 @@ function calculatePredictionDetails(userRankInput, historicalCutoffs) {
             totalWeight += weight;
         }
     });
-
     if (totalWeight === 0) { 
         return {
-            projectedRank: null,
-            probability: 0,
-            confidence: "very low",
-            message: "Insufficient valid historical data for projection.",
-            recommendation: getBaseRecommendation(0),
+            projectedRank: null, probability: 0, confidence: "very low",
+            message: "Insufficient valid historical data for projection.", recommendation: getBaseRecommendation(0),
             historicalDataForDisplay: historicalCutoffs.map(h => ({...h})) 
         };
     }
     let projectedClosingRank = weightedRankSum / totalWeight;
-
     if (historicalCutoffs.length >= 2) {
         const latest = historicalCutoffs[0]; 
         const previous = historicalCutoffs[1]; 
@@ -179,10 +140,8 @@ function calculatePredictionDetails(userRankInput, historicalCutoffs) {
     const stdDevHistRanks = calculateStandardDeviation(historicalRanksForConfidence);
     const relativeStdDev = historicalRanksForConfidence.length > 0 && projectedClosingRank > 0 ?
                            stdDevHistRanks / projectedClosingRank : 1; 
-
     let confidence = "low";
     const nPoints = historicalRanksForConfidence.length;
-
     if (nPoints >= 4) {
         if (relativeStdDev < 0.10) confidence = "very high";
         else if (relativeStdDev < 0.15) confidence = "high";
@@ -198,19 +157,13 @@ function calculatePredictionDetails(userRankInput, historicalCutoffs) {
     } else { 
         confidence = "very low";
     }
-
     const message = getRecommendationMessage(finalProbability, confidence);
     const recommendation = getBaseRecommendation(finalProbability);
-
     return {
-        projectedRank: projectedClosingRank,
-        probability: +(finalProbability.toFixed(2)),
-        confidence,
-        message,
-        recommendation,
+        projectedRank: projectedClosingRank, probability: +(finalProbability.toFixed(2)),
+        confidence, message, recommendation,
     };
 }
-
 
 function getRecommendationMessage(probability, confidence) {
     const baseMessage = getBaseRecommendation(probability);
@@ -238,36 +191,30 @@ function getInstituteType(value) {
     if (!value) return 'UNKNOWN';
     const valStr = String(value).trim();
     const valUpper = valStr.toUpperCase();
-
     if (valUpper === 'IIT') return 'IIT';
     if (valUpper === 'NIT') return 'NIT';
     if (valUpper === 'IIIT') return 'IIIT';
     if (valUpper === 'GFTI') return 'GFTI';
-
     const nameLower = valStr.toLowerCase();
     if (nameLower.includes('indian institute of technology') || nameLower.startsWith('iit')) return 'IIT';
     if (nameLower.includes('national institute of technology') || nameLower.includes('iiest, shibpur') || nameLower.startsWith('nit')) return 'NIT';
     if (nameLower.includes('indian institute of information technology') || nameLower.startsWith('iiit')) return 'IIIT';
-    
     return 'GFTI'; 
 }
-
 
 // --- Endpoints ---
 app.get('/health', async (req, res) => {
     try {
         const dbResult = await pool.query('SELECT NOW()');
         res.status(200).json({
-            success: true,
-            database: "connected",
+            success: true, database: "connected",
             redis: redisClient.isReady ? "connected" : "disconnected",
             timestamp: dbResult.rows[0].now
         });
     } catch (error) {
         console.error("Health check error:", error);
         res.status(500).json({
-            success: false,
-            database: "disconnected",
+            success: false, database: "disconnected",
             redis: redisClient.isReady ? "connected" : "disconnected",
             error: error.message
         });
@@ -311,12 +258,11 @@ app.post('/filter', async (req, res) => {
             institute, AcademicProgramName, quota, SeatType, gender,
             userRank: userRankInt, Year: effectiveYear, round: effectiveRound, instituteType
         };
-        // Cache key version bump due to significant sorting logic change
-        const cacheKey = `filter:v9_targeted_sort:${JSON.stringify(actualFiltersForCache)}`;
+        const cacheKey = `filter:v10_anchor_priority:${JSON.stringify(actualFiltersForCache)}`; // Cache key version bump
 
         const cachedData = await getFromCache(cacheKey);
         if (cachedData) {
-            console.log('Serving filter results from cache (v9_targeted_sort) for key:', cacheKey);
+            console.log(`Serving filter results from cache (${cacheKey.split(':')[1]}) for key:`, cacheKey);
             return res.status(200).json(cachedData);
         }
 
@@ -327,11 +273,10 @@ app.post('/filter', async (req, res) => {
                 NULLIF("Opening Rank", '')::INTEGER AS "Opening Rank",
                 NULLIF("Closing Rank", '')::INTEGER AS "Closing Rank"
         `;
-        // rank_diff is calculated based on userRankInt and Closing Rank from the selected Year/Round.
-        // It's used for the initial SQL sort if userRankInt is present.
-        // The more complex JS sort later will refine this.
         if (userRankInt) {
-            filterQuery += `, ABS(NULLIF("Closing Rank", '')::INTEGER - $1) AS rank_diff`;
+            // This rank_diff is based on userRank, not the anchorRank.
+            // It helps SQL pre-filter/sort somewhat, but JS sort is primary.
+            filterQuery += `, ABS(NULLIF("Closing Rank", '')::INTEGER - $1) AS rank_diff_from_user`;
         }
         filterQuery += ` FROM public.combined_josaa_in WHERE 1=1 `;
         
@@ -360,8 +305,8 @@ app.post('/filter', async (req, res) => {
 
         if (userRankInt) {
             filterQuery += ` AND NULLIF("Closing Rank", '') IS NOT NULL AND NULLIF("Closing Rank", '')::INTEGER > 0`;
-            // Initial sort by rank_diff to get relevant items, JS sort will be more sophisticated
-            filterQuery += ` ORDER BY rank_diff ASC, "Year" DESC, "Round" DESC`; 
+            // Order by rank_diff_from_user to bring somewhat relevant items for JS sort to process
+            filterQuery += ` ORDER BY rank_diff_from_user ASC, "Year" DESC, "Round" DESC`; 
         } else {
             filterQuery += ` ORDER BY "Institute" ASC, "Academic Program Name" ASC, "Year" DESC, "Round" DESC, COALESCE(NULLIF("Closing Rank", '')::INTEGER, 9999999) ASC`;
         }
@@ -402,36 +347,30 @@ app.post('/filter', async (req, res) => {
                 filteredData = filteredData.map(row => {
                     const key = `${row.Institute}|${row["Academic Program Name"]}|${row.Quota}|${row["Seat Type"]}|${row.Gender}`;
                     const fullHistoryForProgram = historicalDataGrouped[key] || [];
-                    
                     const latestRoundCutoffsPerYear = [];
                     const seenYears = new Set();
                     fullHistoryForProgram.sort((a, b) => { 
                         if (b.year !== a.year) return b.year - a.year;
                         return b.round - a.round;
                     });
-
                     for (const histItem of fullHistoryForProgram) {
                         if (histItem.closeRank !== null && !isNaN(histItem.closeRank) && !seenYears.has(histItem.year)) {
                             latestRoundCutoffsPerYear.push(histItem);
                             seenYears.add(histItem.year);
                         }
                     }
-                    
                     const predictionOutput = calculatePredictionDetails(userRankInt, latestRoundCutoffsPerYear);
                     const instituteCategory = getInstituteType(row["College type"] || row.Institute);
-                    
                     return {
-                        ...row, 
-                        ...predictionOutput, 
-                        instituteCategory,
+                        ...row, ...predictionOutput, instituteCategory,
                         historicalDataForDisplay: latestRoundCutoffsPerYear.sort((a,b) => b.year - a.year) 
                     };
                 });
 
-                // ----- START OF NEW SORTING LOGIC -----
+                // ----- START OF REVISED SORTING LOGIC (v10_anchor_priority) -----
                 const typeOrder = { 'IIT': 1, 'NIT': 2, 'IIIT': 3, 'GFTI': 4, 'UNKNOWN': 5 };
-                const TARGET_ANCHOR_RANK_OFFSET = 1000; // User wants to see ranks around UR - 1000
-                const TARGET_ANCHOR_RANGE = 500;    // Window size around the targetAnchorRank
+                const TARGET_ANCHOR_RANK_OFFSET = 1000;
+                const TARGET_ANCHOR_RANGE = 1000; // Wider range: targetAnchorRank +/- 1000
 
                 filteredData.sort((a, b) => {
                     // 1. Sort by Institute Category (IIT > NIT > IIIT > GFTI)
@@ -439,99 +378,74 @@ app.post('/filter', async (req, res) => {
                     const typeBOrder = typeOrder[b.instituteCategory] || typeOrder['UNKNOWN'];
                     if (typeAOrder !== typeBOrder) return typeAOrder - typeBOrder;
 
-                    // Prepare common variables for comparison
                     const ur = userRankInt;
+                    // CR is the closing rank for the specific year/round of THIS row (from initialResult)
                     const crA = a["Closing Rank"] === null || isNaN(Number(a["Closing Rank"])) ? Infinity : Number(a["Closing Rank"]);
                     const crB = b["Closing Rank"] === null || isNaN(Number(b["Closing Rank"])) ? Infinity : Number(b["Closing Rank"]);
-                    const projRankA = a.projectedRank !== null && !isNaN(a.projectedRank) ? a.projectedRank : crA;
-                    const projRankB = b.projectedRank !== null && !isNaN(b.projectedRank) ? b.projectedRank : crB;
+                    const projRankA = a.projectedRank !== null && !isNaN(a.projectedRank) ? a.projectedRank : Infinity;
+                    const projRankB = b.projectedRank !== null && !isNaN(b.projectedRank) ? b.projectedRank : Infinity;
                     const probA = a.probability;
                     const probB = b.probability;
 
                     const targetAnchorRank = Math.max(1, ur - TARGET_ANCHOR_RANK_OFFSET);
 
-                    // Categorize items for sorting priority
+                    // Determine categories
                     let categoryA, categoryB;
 
-                    // Determine category for item A
-                    if (crA <= ur) { // Historically, user's rank was good enough
-                        if (Math.abs(crA - targetAnchorRank) <= TARGET_ANCHOR_RANGE) {
-                            categoryA = 1; // Sweet spot: CR <= UR and close to targetAnchorRank
-                        } else {
-                            categoryA = 2; // Still CR <= UR, but outside sweet spot
-                        }
-                    } else { // Historically, user's rank was NOT good enough (crA > ur)
-                        // ur <= projRankA means user's rank is better than or equal to projected rank (good chance)
-                        if (ur <= projRankA) { 
-                            categoryA = 3; // Projected good chance, despite crA > ur
-                        } else {
-                            categoryA = 4; // Aspirational: crA > ur and ur > projRankA (low chance)
-                        }
-                    }
+                    // Category for A
+                    if (crA !== Infinity && Math.abs(crA - targetAnchorRank) <= TARGET_ANCHOR_RANGE) categoryA = 1;
+                    else if (projRankA !== Infinity && Math.abs(projRankA - targetAnchorRank) <= TARGET_ANCHOR_RANGE) categoryA = 2;
+                    else if (crA !== Infinity && crA <= ur) categoryA = 3;
+                    else if (projRankA !== Infinity && projRankA <= ur) categoryA = 4;
+                    else categoryA = 5;
 
-                    // Determine category for item B (similarly)
-                    if (crB <= ur) {
-                        if (Math.abs(crB - targetAnchorRank) <= TARGET_ANCHOR_RANGE) {
-                            categoryB = 1;
-                        } else {
-                            categoryB = 2;
-                        }
-                    } else { 
-                        if (ur <= projRankB) {
-                            categoryB = 3;
-                        } else {
-                            categoryB = 4;
-                        }
-                    }
+                    // Category for B
+                    if (crB !== Infinity && Math.abs(crB - targetAnchorRank) <= TARGET_ANCHOR_RANGE) categoryB = 1;
+                    else if (projRankB !== Infinity && Math.abs(projRankB - targetAnchorRank) <= TARGET_ANCHOR_RANGE) categoryB = 2;
+                    else if (crB !== Infinity && crB <= ur) categoryB = 3;
+                    else if (projRankB !== Infinity && projRankB <= ur) categoryB = 4;
+                    else categoryB = 5;
                     
-                    // 2. Primary sort by these categories
                     if (categoryA !== categoryB) {
-                        return categoryA - categoryB; // Lower category number comes first
+                        return categoryA - categoryB;
                     }
 
-                    // 3. Secondary sort within the same category
-                    switch (categoryA) { // Both items are in the same category here
-                        case 1: // CR <= ur AND CR is very close to targetAnchorRank ("Sweet Spot")
-                            // Sort by actual closeness to targetAnchorRank (closer is better)
-                            const distA_target = Math.abs(crA - targetAnchorRank);
-                            const distB_target = Math.abs(crB - targetAnchorRank);
-                            if (distA_target !== distB_target) return distA_target - distB_target;
-                            // Then by probability (higher is better)
+                    // Secondary sort within the same category
+                    switch (categoryA) {
+                        case 1: // Historical Anchor Focus
+                            const distCrA_target = Math.abs(crA - targetAnchorRank);
+                            const distCrB_target = Math.abs(crB - targetAnchorRank);
+                            if (distCrA_target !== distCrB_target) return distCrA_target - distCrB_target;
+                            if (probB !== probA) return probB - probA; // Higher probability is better
+                            return crA - crB; // Lower actual CR is better
+
+                        case 2: // Projected Anchor Focus
+                            const distProjA_target = Math.abs(projRankA - targetAnchorRank);
+                            const distProjB_target = Math.abs(projRankB - targetAnchorRank);
+                            if (distProjA_target !== distProjB_target) return distProjA_target - distProjB_target;
                             if (probB !== probA) return probB - probA;
-                            // Then by CR (lower/better rank is better)
+                            return projRankA - projRankB; // Lower projected rank is better
+                        
+                        case 3: // Historically Safer
+                            if (probB !== probA) return probB - probA;
                             return crA - crB;
 
-                        case 2: // CR <= ur (but not in Category 1 - other historically achievable)
-                            // Sort by probability (higher is better)
+                        case 4: // Projected Safer
                             if (probB !== probA) return probB - probA;
-                            // Then by CR (lower/better rank is better)
-                            return crA - crB;
+                            return projRankA - projRankB;
 
-                        case 3: // CR > ur AND ur <= projRank (Projected good chance - these were the "too easy" ones previously)
-                            // Sort by probability (higher is better - most will be 0.98)
+                        case 5: // Aspirational/Other
                             if (probB !== probA) return probB - probA;
-                            // Then by projected rank (lower/better ProjR is better, prioritize tighter fits)
-                            if (projRankA !== projRankB) return projRankA - projRankB;
-                            // Then by CR (lower/better CR is better)
-                            return crA - crB;
-
-                        case 4: // CR > ur AND ur > projRank (Aspirational - low chance)
-                            // Sort by probability (higher is better, though all likely low to moderate)
-                            if (probB !== probA) return probB - probA;
-                            // Then by closeness of projected rank to user rank (closer is better)
-                            const diffProjA = Math.abs(projRankA - ur);
-                            const diffProjB = Math.abs(projRankB - ur);
-                            if (diffProjA !== diffProjB) return diffProjA - diffProjB;
-                            // Then by closeness of actual CR (from last year) to user rank
-                            const diffCrA = Math.abs(crA - ur); // Equivalent to rank_diff for item A
-                            const diffCrB = Math.abs(crB - ur); // Equivalent to rank_diff for item B
-                            if (diffCrA !== diffCrB) return diffCrA - diffCrB;
-                            // Finally by CR itself (more competitive/lower CR is better)
-                            return crA - crB;
+                            const diffProjA_ur = Math.abs(projRankA - ur);
+                            const diffProjB_ur = Math.abs(projRankB - ur);
+                            if (diffProjA_ur !== diffProjB_ur) return diffProjA_ur - diffProjB_ur;
+                            const diffCrA_ur = Math.abs(crA - ur);
+                            const diffCrB_ur = Math.abs(crB - ur);
+                            return diffCrA_ur - diffCrB_ur;
                     }
-                    return 0; // Should ideally not be reached if categories cover all cases
+                    return 0;
                 });
-                // ----- END OF NEW SORTING LOGIC -----
+                // ----- END OF REVISED SORTING LOGIC -----
             }
         } else if (filteredData.length > 0) { // No user rank, but data exists
             filteredData.forEach(row => {
@@ -554,7 +468,7 @@ app.post('/filter', async (req, res) => {
             message: filteredData.length === 0 ? "No matches found." : (userRankInt ? "Results with prediction." : "Filtered results."),
             filterData: filteredData, appliedFilters: actualFiltersForCache
         };
-        await cacheResponse(cacheKey, responseData, userRankInt ? 1800 : 3600); // Cache for 30min if rank, 1hr otherwise
+        await cacheResponse(cacheKey, responseData, userRankInt ? 1800 : 3600);
         res.status(200).json(responseData);
 
     } catch (error) {
@@ -567,30 +481,24 @@ app.post('/filter', async (req, res) => {
 app.get('/suggest-institutes', async (req, res) => {
     const { term, type } = req.query;
     const cacheKey = `suggest-institutes:v3_collegetype:${term?.toLowerCase() || 'all'}:${type?.toLowerCase() || 'all'}`;
-
     try {
         const cachedData = await getFromCache(cacheKey);
         if (cachedData) return res.json(cachedData);
-
         let query = `SELECT DISTINCT "Institute" FROM public.combined_josaa_in WHERE 1=1 `;
         const params = [];
         let paramIndex = 1;
-
         if (term && term.trim() !== '') {
             query += ` AND "Institute" ILIKE $${paramIndex++}`;
             params.push(`%${term}%`);
         }
-        
         if (type && type.toLowerCase() !== 'all') {
             const instType = type.toLowerCase(); 
             query += ` AND "College type" ILIKE $${paramIndex++}`;
             params.push(instType); 
         }
-
         query += ` ORDER BY "Institute" ASC LIMIT 20;`;
         const result = await pool.query(query, params);
         const suggestions = result.rows.map(r => r.Institute);
-
         await cacheResponse(cacheKey, suggestions, 3600);
         res.json(suggestions);
     } catch (error) {
@@ -605,11 +513,9 @@ app.get('/suggest-programs', async (req, res) => {
          return res.status(400).json({ success: false, message: "Search term required" });
      }
     const cacheKey = `suggest-programs:v2:${term.toLowerCase()}`;
-
     try {
         const cachedData = await getFromCache(cacheKey);
         if (cachedData) return res.json(cachedData);
-
         const query = `
             SELECT DISTINCT "Academic Program Name" as program
             FROM public.combined_josaa_in
@@ -619,7 +525,6 @@ app.get('/suggest-programs', async (req, res) => {
         `;
         const result = await pool.query(query, [`%${term}%`]);
         const programs = result.rows.map(r => r.program);
-
         await cacheResponse(cacheKey, programs, 3600);
         res.json(programs);
     } catch (error) {
@@ -630,7 +535,6 @@ app.get('/suggest-programs', async (req, res) => {
 
 app.post('/rank-trends', async (req, res) => { 
     const { institute, program, SeatType, quota, gender } = req.body;
-
     if (!institute || !program || !SeatType || !quota || !gender) {
         return res.status(400).json({
             success: false,
@@ -641,7 +545,6 @@ app.post('/rank-trends', async (req, res) => {
     try {
         const cachedData = await getFromCache(cacheKey);
         if (cachedData) return res.status(200).json(cachedData);
-
         const query = `
             SELECT "Year", "Round", NULLIF("Opening Rank", '')::INTEGER AS "Opening Rank", NULLIF("Closing Rank", '')::INTEGER AS "Closing Rank"
             FROM public.combined_josaa_in
@@ -650,7 +553,6 @@ app.post('/rank-trends', async (req, res) => {
         `;
         const params = [institute, program, SeatType, quota, gender];
         const result = await pool.query(query, params);
-        
         const trendsByYear = {};
         result.rows.forEach(row => {
             if (row["Closing Rank"] !== null && !isNaN(row["Closing Rank"])){ 
@@ -660,7 +562,6 @@ app.post('/rank-trends', async (req, res) => {
             }
         });
         const finalData = Object.values(trendsByYear).sort((a,b) => a.Year - b.Year);
-
         const responseData = {
             success: true,
             message: finalData.length === 0 ? "No trend data found for the specified criteria." : "Trend data fetched.",
@@ -679,7 +580,6 @@ app.get('/filter-options', async (req, res) => {
     try {
         const cachedData = await getFromCache(cacheKey);
         if (cachedData) return res.status(200).json(cachedData);
-
         const [yearsResult, quotasResult, seatTypesResult, gendersResult, roundsResult, collegeTypesResult] = await Promise.all([
             pool.query('SELECT DISTINCT "Year" FROM public.combined_josaa_in ORDER BY "Year" DESC'),
             pool.query('SELECT DISTINCT "Quota" FROM public.combined_josaa_in WHERE "Quota" IS NOT NULL ORDER BY "Quota" ASC'),
@@ -696,18 +596,21 @@ app.get('/filter-options', async (req, res) => {
             rounds: roundsResult.rows.map(row => row.Round),
             instituteTypes: collegeTypesResult.rows.map(row => row["College type"]) 
         };
-        
         const lowerCaseInstituteTypes = options.instituteTypes.map(it => it.toLowerCase());
-        if (!lowerCaseInstituteTypes.includes('all')) {
-            const allIndex = lowerCaseInstituteTypes.indexOf('all'); // Check again in case 'All' or 'ALL' exists
-            if (allIndex === -1) { // If 'all' (any case) is not present
-                 options.instituteTypes.unshift('All'); 
-            } else { // If 'All' or 'ALL' exists, ensure it's standardized, e.g., 'All'
-                 options.instituteTypes[allIndex] = 'All';
+        let allPresent = false;
+        let allIndex = -1;
+        for(let i=0; i < options.instituteTypes.length; i++){
+            if(options.instituteTypes[i].toLowerCase() === 'all'){
+                allPresent = true;
+                allIndex = i;
+                break;
             }
         }
-
-
+        if (!allPresent) {
+            options.instituteTypes.unshift('All'); 
+        } else {
+            options.instituteTypes[allIndex] = 'All'; // Standardize to 'All'
+        }
         await cacheResponse(cacheKey, options, 86400); 
         res.status(200).json(options);
     } catch (error) {
