@@ -65,7 +65,7 @@ async function getFromCache(key) {
     }
 }
 
-// --- Probability & Analysis Helper Functions ---
+// --- Probability & Analysis Helper Functions (for display only, not sorting) ---
 function calculateStandardDeviation(values) {
     if (!values || values.length === 0) return 0;
     const n = values.length;
@@ -219,14 +219,33 @@ function getDynamicAnchorOffset(userRank) {
     return 30000;
 }
 
-
 // --- Endpoints ---
-app.get('/health', async (req, res) => { /* ... unchanged ... */ });
+app.get('/health', async (req, res) => {
+    try {
+        const pgPing = await pool.query('SELECT 1');
+        const redisPing = await redisClient.ping();
+        res.status(200).json({
+            status: 'ok',
+            postgres: pgPing.rowCount === 1 ? 'connected' : 'error',
+            redis: redisPing === 'PONG' ? 'connected' : 'error',
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        console.error("Health check error:", error);
+        res.status(500).json({
+            status: 'error',
+            message: 'Health check failed',
+            error: error.message,
+            postgres: 'error',
+            redis: 'error'
+        });
+    }
+});
 
 app.post('/filter', async (req, res) => {
     const {
         institute, AcademicProgramName, quota, SeatType, gender,
-        userRank, Year, round, instituteType
+        userRank, Year, round, instituteType // This is the filter from the UI for institute type
     } = req.body;
 
     let userRankInt = null;
@@ -243,25 +262,20 @@ app.post('/filter', async (req, res) => {
     try {
         if (effectiveYear === null) {
             const latestYearResult = await pool.query(`SELECT MAX("Year") as max_year FROM public.combined_josaa_in`);
-            if (latestYearResult.rows.length > 0 && latestYearResult.rows[0].max_year !== null) {
-                effectiveYear = parseInt(latestYearResult.rows[0].max_year, 10);
-            } else { effectiveYear = new Date().getFullYear(); /* Fallback if DB is empty */ }
+            effectiveYear = (latestYearResult.rows.length > 0 && latestYearResult.rows[0].max_year !== null) ? parseInt(latestYearResult.rows[0].max_year, 10) : new Date().getFullYear();
         }
         if (effectiveRound === null && effectiveYear !== null) {
             const latestRoundResult = await pool.query(
                 `SELECT MAX("Round") as max_round FROM public.combined_josaa_in WHERE "Year" = $1`, [effectiveYear]
             );
-            if (latestRoundResult.rows.length > 0 && latestRoundResult.rows[0].max_round !== null) {
-                effectiveRound = parseInt(latestRoundResult.rows[0].max_round, 10);
-            } else { effectiveRound = 1; /* Fallback */ }
+            effectiveRound = (latestRoundResult.rows.length > 0 && latestRoundResult.rows[0].max_round !== null) ? parseInt(latestRoundResult.rows[0].max_round, 10) : 1;
         }
 
         const actualFiltersForCache = {
             institute, AcademicProgramName, quota, SeatType, gender,
             userRank: userRankInt, Year: effectiveYear, round: effectiveRound, instituteType
         };
-        // Cache key version bump for new sorting logic
-        const cacheKey = `filter:v14_refined_sort:${JSON.stringify(actualFiltersForCache)}`;
+        const cacheKey = `filter:v15_simple_anchor_sort:${JSON.stringify(actualFiltersForCache)}`;
 
         const cachedData = await getFromCache(cacheKey);
         if (cachedData) {
@@ -272,7 +286,7 @@ app.post('/filter', async (req, res) => {
         let filterQuery = `
             SELECT
                 "Institute", "Academic Program Name", "Quota", "Seat Type", "Gender",
-                "Year", "Round", "College type",
+                "Year", "Round", "College type", 
                 NULLIF("Opening Rank", '')::INTEGER AS "Opening Rank",
                 NULLIF("Closing Rank", '')::INTEGER AS "Closing Rank"
         `;
@@ -306,20 +320,24 @@ app.post('/filter', async (req, res) => {
 
         if (userRankInt) {
             filterQuery += ` AND NULLIF("Closing Rank", '') IS NOT NULL AND NULLIF("Closing Rank", '')::INTEGER > 0`;
-            filterQuery += ` ORDER BY rank_diff_from_user ASC, "Year" DESC, "Round" DESC`; // SQL pre-sort
+            filterQuery += ` ORDER BY rank_diff_from_user ASC, "Year" DESC, "Round" DESC`;
         } else {
             filterQuery += ` ORDER BY "Institute" ASC, "Academic Program Name" ASC, "Year" DESC, "Round" DESC, COALESCE(NULLIF("Closing Rank", '')::INTEGER, 9999999) ASC`;
         }
 
-        const sqlLimit = userRankInt ? 2000 : 750;
+        const sqlLimit = userRankInt ? 2500 : 750;
         filterQuery += ` LIMIT ${sqlLimit};`;
 
         const initialResult = await pool.query(filterQuery, params);
         let filteredData = initialResult.rows;
 
+        // Assign instituteCategory to all rows *before* prediction and sorting
+        filteredData.forEach(row => {
+            row.instituteCategory = getInstituteType(row["College type"] || row.Institute);
+        });
+
         if (userRankInt && filteredData.length > 0) {
             const programMapForHistory = new Map();
-            // ... (historical data fetching: unchanged, assumed correct) ...
             filteredData.forEach(row => {
                 const key = `${row.Institute}|${row["Academic Program Name"]}|${row.Quota}|${row["Seat Type"]}|${row.Gender}`;
                 if (!programMapForHistory.has(key)) {
@@ -347,7 +365,7 @@ app.post('/filter', async (req, res) => {
                     historicalDataGrouped[key].push({ year: row.Year, round: row.Round, closeRank: row["Closing Rank"] });
                 });
 
-                filteredData = filteredData.map(row => {
+                filteredData = filteredData.map(row => { // `instituteCategory` is already on `row`
                     const key = `${row.Institute}|${row["Academic Program Name"]}|${row.Quota}|${row["Seat Type"]}|${row.Gender}`;
                     const fullHistoryForProgram = historicalDataGrouped[key] || [];
                     const latestRoundCutoffsPerYear = [];
@@ -363,88 +381,61 @@ app.post('/filter', async (req, res) => {
                         }
                     }
                     const predictionOutput = calculatePredictionDetails(userRankInt, latestRoundCutoffsPerYear);
-                    const instituteCategory = getInstituteType(row["College type"] || row.Institute); // Ensure this uses the correct "College type" from DB
                     return {
-                        ...row, ...predictionOutput, instituteCategory,
+                        ...row, ...predictionOutput,
                         historicalDataForDisplay: latestRoundCutoffsPerYear.sort((a,b) => b.year - a.year)
                     };
                 });
             }
-            // ----- START OF REFINED SORTING LOGIC (v14_refined_sort) -----
-            const typeOrder = { 'IIT': 1, 'NIT': 2, 'IIIT': 3, 'GFTI': 4, 'UNKNOWN': 5 };
 
-            // Calculate anchorRankForSort ONCE before the sort function
+            // ----- START OF SIMPLIFIED SORTING LOGIC (v15_simple_anchor_sort) -----
+            const typeOrder = { 'IIT': 1, 'NIT': 2, 'IIIT': 3, 'GFTI': 4, 'UNKNOWN': 5 };
             const dynamicOffset = getDynamicAnchorOffset(userRankInt);
             const anchorRankForSort = Math.max(1, userRankInt - dynamicOffset);
             console.log(`User Rank: ${userRankInt}, Dynamic Offset: ${dynamicOffset}, Anchor Rank for Sort: ${anchorRankForSort}`);
 
             filteredData.sort((a, b) => {
-                // 1. Sort by Institute Category (Primary Key)
+                // 1. Anchor Grouping (Primary Sort Factor)
+                const crA = a["Closing Rank"] === null || isNaN(Number(a["Closing Rank"])) ? Infinity : Number(a["Closing Rank"]);
+                const crB = b["Closing Rank"] === null || isNaN(Number(b["Closing Rank"])) ? Infinity : Number(b["Closing Rank"]);
+
+                const groupA = (crA >= anchorRankForSort) ? 1 : 2; // Group 1: Achievable/Safer
+                const groupB = (crB >= anchorRankForSort) ? 1 : 2; // Group 2: Aspirational
+
+                if (groupA !== groupB) {
+                    return groupA - groupB; // Group 1 (achievable/safer) comes before Group 2 (aspirational)
+                }
+
+                // 2. Within the same Anchor Group:
+                // 2a. Sort by Institute Category
+                // instituteCategory is already assigned to a and b
                 const typeAOrder = typeOrder[a.instituteCategory] || typeOrder['UNKNOWN'];
                 const typeBOrder = typeOrder[b.instituteCategory] || typeOrder['UNKNOWN'];
                 if (typeAOrder !== typeBOrder) {
                     return typeAOrder - typeBOrder;
                 }
 
-                // 2. Sort by Year (descending) - All items in filteredData usually have the same effectiveYear
-                // This is mostly for logical completeness or edge cases.
-                if (a.Year !== b.Year) {
-                    return b.Year - a.Year; // Latest year first
-                }
-
-                // 3. Sort by Round (descending) - All items in filteredData usually have the same effectiveRound
-                if (a.Round !== b.Round) {
-                    return b.Round - a.Round; // Latest round first
-                }
-
-                // 4. Dynamic Anchor Sorting Logic
-                const crA = a["Closing Rank"] === null || isNaN(Number(a["Closing Rank"])) ? Infinity : Number(a["Closing Rank"]);
-                const crB = b["Closing Rank"] === null || isNaN(Number(b["Closing Rank"])) ? Infinity : Number(b["Closing Rank"]);
-
-                // 4a. Determine Anchor Group (using pre-calculated anchorRankForSort)
-                const groupA = (crA >= anchorRankForSort) ? 1 : 2;
-                const groupB = (crB >= anchorRankForSort) ? 1 : 2;
-
-                if (groupA !== groupB) {
-                    return groupA - groupB; // Group 1 (CR >= anchor) before Group 2 (CR < anchor)
-                }
-
-                // 4b. Within the same group, sort by Closing Rank (ascending)
+                // 2b. Then, sort by Closing Rank (ascending)
+                // This makes sure that within an anchor group AND institute type, better ranks come first.
                 if (crA !== crB) {
                     return crA - crB;
                 }
-
-                // 5. Tie-breakers
-                const probA = a.probability !== undefined ? a.probability : -1; // Default if undefined
-                const probB = b.probability !== undefined ? b.probability : -1;
-                if (probB !== probA) {
-                    return probB - probA; // Higher probability first
-                }
-
-                const projRankA = a.projectedRank !== null && !isNaN(a.projectedRank) ? a.projectedRank : Infinity;
-                const projRankB = b.projectedRank !== null && !isNaN(b.projectedRank) ? b.projectedRank : Infinity;
-                if (projRankA !== projRankB) {
-                    return projRankA - projRankB; // Lower projected rank first
-                }
-
-                // Fallback: Institute Name
+                
+                // 3. Fallback: Institute Name (alphabetical)
                 return (a.Institute || "").localeCompare(b.Institute || "");
             });
-            // ----- END OF REFINED SORTING LOGIC -----
+            // ----- END OF SIMPLIFIED SORTING LOGIC -----
 
-        } else if (filteredData.length > 0) { // No user rank
-            filteredData.forEach(row => {
-                row.instituteCategory = getInstituteType(row["College type"] || row.Institute);
-            });
+        } else if (filteredData.length > 0) { // No user rank, sort by Institute Type, then Institute, then Program
+            // instituteCategory was added to all rows at the start of the try block
             const typeOrder = { 'IIT': 1, 'NIT': 2, 'IIIT': 3, 'GFTI': 4, 'UNKNOWN': 5 };
             filteredData.sort((a,b) => {
                 const typeAOrder = typeOrder[a.instituteCategory] || typeOrder['UNKNOWN'];
                 const typeBOrder = typeOrder[b.instituteCategory] || typeOrder['UNKNOWN'];
                 if (typeAOrder !== typeBOrder) return typeAOrder - typeBOrder;
-
-                // For no user rank, sort by Year then Round if types are same
-                if (a.Year !== b.Year) return b.Year - a.Year;
-                if (a.Round !== b.Round) return b.Round - a.Round;
+                
+                if (a.Year !== b.Year) return b.Year - a.Year; // Latest year first
+                if (a.Round !== b.Round) return b.Round - a.Round; // Latest round first
                 
                 if ((a.Institute || "").localeCompare(b.Institute || "") !== 0) {
                      return (a.Institute || "").localeCompare(b.Institute || "");
@@ -458,7 +449,7 @@ app.post('/filter', async (req, res) => {
             message: filteredData.length === 0 ? "No matches found." : (userRankInt ? "Results with prediction." : "Filtered results."),
             filterData: filteredData, appliedFilters: actualFiltersForCache
         };
-        await cacheResponse(cacheKey, responseData, userRankInt ? 1800 : 3600); // 30 min cache for user rank, 1hr otherwise
+        await cacheResponse(cacheKey, responseData, userRankInt ? 1800 : 3600);
         res.status(200).json(responseData);
 
     } catch (error) {
@@ -467,11 +458,9 @@ app.post('/filter', async (req, res) => {
     }
 });
 
-// ... (other endpoints: /suggest-institutes, /suggest-programs, /rank-trends, /filter-options - unchanged from your last full code) ...
-// (Make sure to include them here if you are copying this whole file)
-
 app.get('/suggest-institutes', async (req, res) => {
     const { term, type } = req.query;
+    // Cache key v3 includes type for institute suggestions
     const cacheKey = `suggest-institutes:v3_collegetype:${term?.toLowerCase() || 'all'}:${type?.toLowerCase() || 'all'}`;
     try {
         const cachedData = await getFromCache(cacheKey);
@@ -483,10 +472,10 @@ app.get('/suggest-institutes', async (req, res) => {
             query += ` AND "Institute" ILIKE $${paramIndex++}`;
             params.push(`%${term}%`);
         }
-        if (type && type.toLowerCase() !== 'all') {
-            const instType = type.toLowerCase();
-            query += ` AND "College type" ILIKE $${paramIndex++}`; // Ensure "College type" column is used
-            params.push(instType);
+        // Filter by College type if 'type' query param is present and not 'all'
+        if (type && String(type).toLowerCase() !== 'all') {
+            query += ` AND "College type" ILIKE $${paramIndex++}`;
+            params.push(type); // Assuming type is 'IIT', 'NIT', etc.
         }
         query += ` ORDER BY "Institute" ASC LIMIT 20;`;
         const result = await pool.query(query, params);
@@ -568,7 +557,7 @@ app.post('/rank-trends', async (req, res) => {
 });
 
 app.get('/filter-options', async (req, res) => {
-    const cacheKey = 'filter-options:v4'; // Consider v5 if college types changed how 'All' is handled
+    const cacheKey = 'filter-options:v4';
     try {
         const cachedData = await getFromCache(cacheKey);
         if (cachedData) return res.status(200).json(cachedData);
@@ -597,7 +586,6 @@ app.get('/filter-options', async (req, res) => {
             options.instituteTypes = ['All', ...options.instituteTypes.filter(it => String(it).toLowerCase() !== 'all')];
         }
 
-
         await cacheResponse(cacheKey, options, 86400);
         res.status(200).json(options);
     } catch (error) {
@@ -605,6 +593,7 @@ app.get('/filter-options', async (req, res) => {
         res.status(500).json({ success: false, message: "Error fetching filter options", error: error.message });
     }
 });
+
 
 app.get('/', (req, res) => { res.send('College Predictor API is running!'); });
 
