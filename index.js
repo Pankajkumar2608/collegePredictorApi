@@ -204,12 +204,12 @@ function getInstituteType(value) {
 function getDynamicAnchorOffset(userRank) {
     userRank = Number(userRank);
     if (isNaN(userRank) || userRank <= 0) return 1000;
-    if (userRank <= 10000) return 1500;
-    if (userRank <= 20000) return 2500;
-    if (userRank <= 30000) return 3200;
-    if (userRank <= 40000) return 3900;
-    if (userRank <= 50000) return 4500;
-    if (userRank <= 60000) return 5000;
+    if (userRank <= 10000) return 1000;
+    if (userRank <= 20000) return 1500;
+    if (userRank <= 30000) return 2200;
+    if (userRank <= 40000) return 2900;
+    if (userRank <= 50000) return 3500;
+    if (userRank <= 60000) return 4000;
     if (userRank <= 70000) return 5500;
     if (userRank <= 80000) return 6000;
     if (userRank <= 90000) return 8500;
