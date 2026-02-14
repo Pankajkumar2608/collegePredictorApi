@@ -1,9 +1,9 @@
-import cors from 'cors';
-import dotenv from 'dotenv';
 import express from 'express';
+import cors from 'cors';
 import pkg from 'pg';
-import { createClient } from 'redis';
 const { Pool } = pkg;
+import dotenv from 'dotenv';
+import { createClient } from 'redis';
 
 dotenv.config();
 
@@ -201,6 +201,24 @@ function getInstituteType(value) {
     return 'GFTI';
 }
 
+function getDynamicAnchorOffset(userRank) {
+    userRank = Number(userRank);
+    if (isNaN(userRank) || userRank <= 0) return 1000;
+    if (userRank <= 10000) return 1000;
+    if (userRank <= 20000) return 1500;
+    if (userRank <= 30000) return 2200;
+    if (userRank <= 40000) return 2900;
+    if (userRank <= 50000) return 3500;
+    if (userRank <= 60000) return 4000;
+    if (userRank <= 70000) return 5500;
+    if (userRank <= 80000) return 6000;
+    if (userRank <= 90000) return 8500;
+    if (userRank <= 100000) return 10500;
+    if (userRank <= 150000) return 12500;
+    if (userRank <= 210000) return 20000;
+    return 30000;
+}
+
 // --- Endpoints ---
 app.get('/health', async (req, res) => {
     try {
@@ -257,8 +275,7 @@ app.post('/filter', async (req, res) => {
             institute, AcademicProgramName, quota, SeatType, gender,
             userRank: userRankInt, Year: effectiveYear, round: effectiveRound, instituteType
         };
-        // CHANGED: Cache version bumped to v16 to invalidate old cached results with wrong sort
-        const cacheKey = `filter:v16_rank_closeness_sort:${JSON.stringify(actualFiltersForCache)}`;
+        const cacheKey = `filter:v15_simple_anchor_sort:${JSON.stringify(actualFiltersForCache)}`;
 
         const cachedData = await getFromCache(cacheKey);
         if (cachedData) {
@@ -303,7 +320,6 @@ app.post('/filter', async (req, res) => {
 
         if (userRankInt) {
             filterQuery += ` AND NULLIF("Closing Rank", '') IS NOT NULL AND NULLIF("Closing Rank", '')::INTEGER > 0`;
-            // FIX: Sort by rank_diff_from_user (closeness) as the PRIMARY sort key
             filterQuery += ` ORDER BY rank_diff_from_user ASC, "Year" DESC, "Round" DESC`;
         } else {
             filterQuery += ` ORDER BY "Institute" ASC, "Academic Program Name" ASC, "Year" DESC, "Round" DESC, COALESCE(NULLIF("Closing Rank", '')::INTEGER, 9999999) ASC`;
@@ -349,7 +365,7 @@ app.post('/filter', async (req, res) => {
                     historicalDataGrouped[key].push({ year: row.Year, round: row.Round, closeRank: row["Closing Rank"] });
                 });
 
-                filteredData = filteredData.map(row => {
+                filteredData = filteredData.map(row => { // `instituteCategory` is already on `row`
                     const key = `${row.Institute}|${row["Academic Program Name"]}|${row.Quota}|${row["Seat Type"]}|${row.Gender}`;
                     const fullHistoryForProgram = historicalDataGrouped[key] || [];
                     const latestRoundCutoffsPerYear = [];
@@ -372,43 +388,54 @@ app.post('/filter', async (req, res) => {
                 });
             }
 
-            // ----- START OF FIXED SORTING LOGIC (v16_rank_closeness_sort) -----
-            // FIX: Sort primarily by absolute rank difference (closeness to user's rank).
-            // Institute type is only a tiebreaker when two colleges have similar closing ranks.
+            // ----- START OF SIMPLIFIED SORTING LOGIC (v15_simple_anchor_sort) -----
             const typeOrder = { 'IIT': 1, 'NIT': 2, 'IIIT': 3, 'GFTI': 4, 'UNKNOWN': 5 };
+            const dynamicOffset = getDynamicAnchorOffset(userRankInt);
+            const anchorRankForSort = Math.max(1, userRankInt - dynamicOffset);
+            console.log(`User Rank: ${userRankInt}, Dynamic Offset: ${dynamicOffset}, Anchor Rank for Sort: ${anchorRankForSort}`);
 
             filteredData.sort((a, b) => {
+                // 1. Anchor Grouping (Primary Sort Factor)
                 const crA = a["Closing Rank"] === null || isNaN(Number(a["Closing Rank"])) ? Infinity : Number(a["Closing Rank"]);
                 const crB = b["Closing Rank"] === null || isNaN(Number(b["Closing Rank"])) ? Infinity : Number(b["Closing Rank"]);
 
-                // 1. PRIMARY: Sort by absolute difference from user's rank (closest first)
-                const diffA = Math.abs(crA - userRankInt);
-                const diffB = Math.abs(crB - userRankInt);
-                if (diffA !== diffB) {
-                    return diffA - diffB;
+                const groupA = (crA >= anchorRankForSort) ? 1 : 2; // Group 1: Achievable/Safer
+                const groupB = (crB >= anchorRankForSort) ? 1 : 2; // Group 2: Aspirational
+
+                if (groupA !== groupB) {
+                    return groupA - groupB; // Group 1 (achievable/safer) comes before Group 2 (aspirational)
                 }
 
-                // 2. SECONDARY: When equally close, prefer better institute type
+                // 2. Within the same Anchor Group:
+                // 2a. Sort by Institute Category
+                // instituteCategory is already assigned to a and b
                 const typeAOrder = typeOrder[a.instituteCategory] || typeOrder['UNKNOWN'];
                 const typeBOrder = typeOrder[b.instituteCategory] || typeOrder['UNKNOWN'];
                 if (typeAOrder !== typeBOrder) {
                     return typeAOrder - typeBOrder;
                 }
 
-                // 3. TERTIARY: Alphabetical by institute name
+                // 2b. Then, sort by Closing Rank (ascending)
+                // This makes sure that within an anchor group AND institute type, better ranks come first.
+                if (crA !== crB) {
+                    return crA - crB;
+                }
+                
+                // 3. Fallback: Institute Name (alphabetical)
                 return (a.Institute || "").localeCompare(b.Institute || "");
             });
-            // ----- END OF FIXED SORTING LOGIC -----
+            // ----- END OF SIMPLIFIED SORTING LOGIC -----
 
         } else if (filteredData.length > 0) { // No user rank, sort by Institute Type, then Institute, then Program
+            // instituteCategory was added to all rows at the start of the try block
             const typeOrder = { 'IIT': 1, 'NIT': 2, 'IIIT': 3, 'GFTI': 4, 'UNKNOWN': 5 };
             filteredData.sort((a,b) => {
                 const typeAOrder = typeOrder[a.instituteCategory] || typeOrder['UNKNOWN'];
                 const typeBOrder = typeOrder[b.instituteCategory] || typeOrder['UNKNOWN'];
                 if (typeAOrder !== typeBOrder) return typeAOrder - typeBOrder;
                 
-                if (a.Year !== b.Year) return b.Year - a.Year;
-                if (a.Round !== b.Round) return b.Round - a.Round;
+                if (a.Year !== b.Year) return b.Year - a.Year; // Latest year first
+                if (a.Round !== b.Round) return b.Round - a.Round; // Latest round first
                 
                 if ((a.Institute || "").localeCompare(b.Institute || "") !== 0) {
                      return (a.Institute || "").localeCompare(b.Institute || "");
@@ -433,6 +460,7 @@ app.post('/filter', async (req, res) => {
 
 app.get('/suggest-institutes', async (req, res) => {
     const { term, type } = req.query;
+    // Cache key v3 includes type for institute suggestions
     const cacheKey = `suggest-institutes:v3_collegetype:${term?.toLowerCase() || 'all'}:${type?.toLowerCase() || 'all'}`;
     try {
         const cachedData = await getFromCache(cacheKey);
@@ -444,9 +472,10 @@ app.get('/suggest-institutes', async (req, res) => {
             query += ` AND "Institute" ILIKE $${paramIndex++}`;
             params.push(`%${term}%`);
         }
+        // Filter by College type if 'type' query param is present and not 'all'
         if (type && String(type).toLowerCase() !== 'all') {
             query += ` AND "College type" ILIKE $${paramIndex++}`;
-            params.push(type);
+            params.push(type); // Assuming type is 'IIT', 'NIT', etc.
         }
         query += ` ORDER BY "Institute" ASC LIMIT 20;`;
         const result = await pool.query(query, params);
@@ -549,6 +578,7 @@ app.get('/filter-options', async (req, res) => {
             instituteTypes: collegeTypesResult.rows.map(row => row["College type"])
         };
 
+        // Ensure "All" is present and consistently capitalized at the beginning
         const allPresent = options.instituteTypes.some(it => String(it).toLowerCase() === 'all');
         if (!allPresent) {
             options.instituteTypes.unshift('All');
