@@ -286,7 +286,7 @@ app.post('/filter', async (req, res) => {
             institute, AcademicProgramName, quota, SeatType, gender,
             userRank: userRankInt, Year: effectiveYear, round: effectiveRound, instituteType, userState: normalizedUserState
         };
-        const cacheKey = `filter:v16_state_priority:${JSON.stringify(actualFiltersForCache)}`;
+        const cacheKey = `filter:v17_state_in_achievable:${JSON.stringify(actualFiltersForCache)}`;
 
         const cachedData = await getFromCache(cacheKey);
         if (cachedData) {
@@ -401,24 +401,14 @@ app.post('/filter', async (req, res) => {
                 });
             }
 
-            // ----- ENHANCED SORTING LOGIC WITH STATE PRIORITIZATION (v16_state_priority) -----
+            // ----- ENHANCED SORTING LOGIC WITH CONDITIONAL STATE PRIORITIZATION (v17_state_in_achievable) -----
             const typeOrder = { 'IIT': 1, 'NIT': 2, 'IIIT': 3, 'GFTI': 4, 'UNKNOWN': 5 };
             const dynamicOffset = getDynamicAnchorOffset(userRankInt);
             const anchorRankForSort = Math.max(1, userRankInt - dynamicOffset);
             console.log(`User Rank: ${userRankInt}, Dynamic Offset: ${dynamicOffset}, Anchor Rank for Sort: ${anchorRankForSort}, User State: ${normalizedUserState || 'Not provided'}`);
 
             filteredData.sort((a, b) => {
-                // 0. HOME STATE PRIORITY - comes FIRST (highest priority)
-                // Home state colleges always appear before non-home state colleges
-                if (normalizedUserState) {
-                    const aIsHome = a.isHomeState ? 1 : 0;
-                    const bIsHome = b.isHomeState ? 1 : 0;
-                    if (aIsHome !== bIsHome) {
-                        return bIsHome - aIsHome; // Home state (1) comes before non-home state (0)
-                    }
-                }
-
-                // 1. Anchor Grouping (Second priority - within home/non-home state groups)
+                // 1. First, determine Anchor Grouping (Primary Sort Factor)
                 const crA = a["Closing Rank"] === null || isNaN(Number(a["Closing Rank"])) ? Infinity : Number(a["Closing Rank"]);
                 const crB = b["Closing Rank"] === null || isNaN(Number(b["Closing Rank"])) ? Infinity : Number(b["Closing Rank"]);
 
@@ -429,36 +419,38 @@ app.post('/filter', async (req, res) => {
                     return groupA - groupB; // Group 1 (achievable/safer) comes before Group 2 (aspirational)
                 }
 
-                // 2. Within the same Home State status AND Anchor Group:
-                // 2a. Sort by Institute Category
+                // 2. Within Group 1 (Achievable) ONLY: Apply HOME STATE PRIORITY
+                // Exclude IITs from state priority - IITs don't have home state quota
+                if (groupA === 1 && normalizedUserState) {
+                    const aIsHomeAndNotIIT = a.isHomeState && a.instituteCategory !== 'IIT' ? 1 : 0;
+                    const bIsHomeAndNotIIT = b.isHomeState && b.instituteCategory !== 'IIT' ? 1 : 0;
+                    
+                    if (aIsHomeAndNotIIT !== bIsHomeAndNotIIT) {
+                        return bIsHomeAndNotIIT - aIsHomeAndNotIIT; // Home state (non-IIT) comes first
+                    }
+                }
+
+                // 3. Sort by Institute Category (IIT, NIT, IIIT, GFTI)
                 const typeAOrder = typeOrder[a.instituteCategory] || typeOrder['UNKNOWN'];
                 const typeBOrder = typeOrder[b.instituteCategory] || typeOrder['UNKNOWN'];
                 if (typeAOrder !== typeBOrder) {
                     return typeAOrder - typeBOrder;
                 }
 
-                // 2b. Then, sort by Closing Rank (ascending)
+                // 4. Then, sort by Closing Rank (ascending - better ranks first)
                 if (crA !== crB) {
                     return crA - crB;
                 }
                 
-                // 3. Fallback: Institute Name (alphabetical)
+                // 5. Fallback: Institute Name (alphabetical)
                 return (a.Institute || "").localeCompare(b.Institute || "");
             });
             // ----- END OF ENHANCED SORTING LOGIC -----
 
-        } else if (filteredData.length > 0) { // No user rank, sort by State (if provided), then Institute Type, then Institute, then Program
+        } else if (filteredData.length > 0) { // No user rank, sort by Institute Type, then Institute, then Program
+            // No state priority when user rank is not provided (can't determine achievable range)
             const typeOrder = { 'IIT': 1, 'NIT': 2, 'IIIT': 3, 'GFTI': 4, 'UNKNOWN': 5 };
             filteredData.sort((a,b) => {
-                // Home state priority even without user rank
-                if (normalizedUserState) {
-                    const aIsHome = a.isHomeState ? 1 : 0;
-                    const bIsHome = b.isHomeState ? 1 : 0;
-                    if (aIsHome !== bIsHome) {
-                        return bIsHome - aIsHome;
-                    }
-                }
-
                 const typeAOrder = typeOrder[a.instituteCategory] || typeOrder['UNKNOWN'];
                 const typeBOrder = typeOrder[b.instituteCategory] || typeOrder['UNKNOWN'];
                 if (typeAOrder !== typeBOrder) return typeAOrder - typeBOrder;
