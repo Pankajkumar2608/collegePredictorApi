@@ -219,7 +219,7 @@ function getDynamicAnchorOffset(userRank) {
     return 30000;
 }
 
-// --- NEW: State matching helper function ---
+// --- State matching helper function ---
 function isHomeState(instituteState, userState) {
     if (!instituteState || !userState) return false;
     const instState = String(instituteState).trim().toUpperCase();
@@ -253,7 +253,7 @@ app.get('/health', async (req, res) => {
 app.post('/filter', async (req, res) => {
     const {
         institute, AcademicProgramName, quota, SeatType, gender,
-        userRank, Year, round, instituteType, userState // Added userState parameter
+        userRank, Year, round, instituteType, userState
     } = req.body;
 
     let userRankInt = null;
@@ -286,15 +286,15 @@ app.post('/filter', async (req, res) => {
             institute, AcademicProgramName, quota, SeatType, gender,
             userRank: userRankInt, Year: effectiveYear, round: effectiveRound, instituteType, userState: normalizedUserState
         };
-        const cacheKey = `filter:v17_state_in_achievable:${JSON.stringify(actualFiltersForCache)}`;
+        const cacheKey = `filter:v18_state_window:${JSON.stringify(actualFiltersForCache)}`;
 
         const cachedData = await getFromCache(cacheKey);
         if (cachedData) {
-            console.log(`Serving filter results from cache (${cacheKey.split(':')[1]}) for key:`, cacheKey);
+            console.log(`Serving filter results from cache for key:`, cacheKey);
             return res.status(200).json(cachedData);
         }
 
-        // Modified query to include State column
+        // Query includes State column
         let filterQuery = `
             SELECT
                 "Institute", "Academic Program Name", "Quota", "Seat Type", "Gender",
@@ -343,7 +343,7 @@ app.post('/filter', async (req, res) => {
         const initialResult = await pool.query(filterQuery, params);
         let filteredData = initialResult.rows;
 
-        // Assign instituteCategory and isHomeState to all rows *before* prediction and sorting
+        // Assign instituteCategory and isHomeState to all rows before prediction and sorting
         filteredData.forEach(row => {
             row.instituteCategory = getInstituteType(row["College type"] || row.Institute);
             row.isHomeState = normalizedUserState ? isHomeState(row.State, normalizedUserState) : false;
@@ -401,75 +401,90 @@ app.post('/filter', async (req, res) => {
                 });
             }
 
-            // ----- ENHANCED SORTING LOGIC WITH CONDITIONAL STATE PRIORITIZATION (v17_state_in_achievable) -----
+            // ----- SORTING LOGIC v18: HOME STATE PRIORITY WITH RANK WINDOW -----
             const typeOrder = { 'IIT': 1, 'NIT': 2, 'IIIT': 3, 'GFTI': 4, 'UNKNOWN': 5 };
             const dynamicOffset = getDynamicAnchorOffset(userRankInt);
             const anchorRankForSort = Math.max(1, userRankInt - dynamicOffset);
-            console.log(`User Rank: ${userRankInt}, Dynamic Offset: ${dynamicOffset}, Anchor Rank for Sort: ${anchorRankForSort}, User State: ${normalizedUserState || 'Not provided'}`);
+
+            // Home state boost window: only apply to colleges whose closing rank is
+            // within 2.5x the user's rank. This prevents far-easier colleges (e.g.
+            // a 60k-closing NIT for a rank-10k user) from jumping ahead of genuinely
+            // competitive options just because they're in the user's home state.
+            const homeStateWindow = userRankInt * 2.5;
+
+            console.log(
+                `User Rank: ${userRankInt}, Dynamic Offset: ${dynamicOffset}, ` +
+                `Anchor Rank: ${anchorRankForSort}, Home State Window: ≤${homeStateWindow}, ` +
+                `User State: ${normalizedUserState || 'Not provided'}`
+            );
 
             filteredData.sort((a, b) => {
-                // 1. First, determine Anchor Grouping (Primary Sort Factor)
+                // 1. Anchor Grouping — Group 1: achievable/safer (closing rank >= anchor), Group 2: aspirational
                 const crA = a["Closing Rank"] === null || isNaN(Number(a["Closing Rank"])) ? Infinity : Number(a["Closing Rank"]);
                 const crB = b["Closing Rank"] === null || isNaN(Number(b["Closing Rank"])) ? Infinity : Number(b["Closing Rank"]);
 
-                const groupA = (crA >= anchorRankForSort) ? 1 : 2; // Group 1: Achievable/Safer
-                const groupB = (crB >= anchorRankForSort) ? 1 : 2; // Group 2: Aspirational
+                const groupA = (crA >= anchorRankForSort) ? 1 : 2;
+                const groupB = (crB >= anchorRankForSort) ? 1 : 2;
 
                 if (groupA !== groupB) {
-                    return groupA - groupB; // Group 1 (achievable/safer) comes before Group 2 (aspirational)
+                    return groupA - groupB; // Achievable/safer (Group 1) before aspirational (Group 2)
                 }
 
-                // 2. Within Group 1 (Achievable) ONLY: Apply HOME STATE PRIORITY
-                // Exclude IITs from state priority - IITs don't have home state quota
+                // 2. Within Group 1 only: HOME STATE PRIORITY (with rank window guard)
+                //    - Skip IITs: they use All-India quota, home state is irrelevant
+                //    - Only boost if the college's closing rank is within homeStateWindow
+                //      so that trivially-easy colleges don't float to the top
                 if (groupA === 1 && normalizedUserState) {
-                    const aIsHomeAndNotIIT = a.isHomeState && a.instituteCategory !== 'IIT' ? 1 : 0;
-                    const bIsHomeAndNotIIT = b.isHomeState && b.instituteCategory !== 'IIT' ? 1 : 0;
-                    
+                    const aIsHomeAndNotIIT = a.isHomeState && a.instituteCategory !== 'IIT' && crA <= homeStateWindow ? 1 : 0;
+                    const bIsHomeAndNotIIT = b.isHomeState && b.instituteCategory !== 'IIT' && crB <= homeStateWindow ? 1 : 0;
+
                     if (aIsHomeAndNotIIT !== bIsHomeAndNotIIT) {
-                        return bIsHomeAndNotIIT - aIsHomeAndNotIIT; // Home state (non-IIT) comes first
+                        return bIsHomeAndNotIIT - aIsHomeAndNotIIT; // Home state (non-IIT, within window) first
                     }
                 }
 
-                // 3. Sort by Institute Category (IIT, NIT, IIIT, GFTI)
+                // 3. Institute category order: IIT > NIT > IIIT > GFTI
                 const typeAOrder = typeOrder[a.instituteCategory] || typeOrder['UNKNOWN'];
                 const typeBOrder = typeOrder[b.instituteCategory] || typeOrder['UNKNOWN'];
                 if (typeAOrder !== typeBOrder) {
                     return typeAOrder - typeBOrder;
                 }
 
-                // 4. Then, sort by Closing Rank (ascending - better ranks first)
+                // 4. Closing rank ascending (better/tighter ranks first)
                 if (crA !== crB) {
                     return crA - crB;
                 }
-                
-                // 5. Fallback: Institute Name (alphabetical)
+
+                // 5. Alphabetical fallback
                 return (a.Institute || "").localeCompare(b.Institute || "");
             });
-            // ----- END OF ENHANCED SORTING LOGIC -----
+            // ----- END SORTING LOGIC v18 -----
 
-        } else if (filteredData.length > 0) { // No user rank, sort by Institute Type, then Institute, then Program
-            // No state priority when user rank is not provided (can't determine achievable range)
+        } else if (filteredData.length > 0) {
+            // No user rank provided — sort by institute type, then name, then program
             const typeOrder = { 'IIT': 1, 'NIT': 2, 'IIIT': 3, 'GFTI': 4, 'UNKNOWN': 5 };
-            filteredData.sort((a,b) => {
+            filteredData.sort((a, b) => {
                 const typeAOrder = typeOrder[a.instituteCategory] || typeOrder['UNKNOWN'];
                 const typeBOrder = typeOrder[b.instituteCategory] || typeOrder['UNKNOWN'];
                 if (typeAOrder !== typeBOrder) return typeAOrder - typeBOrder;
-                
-                if (a.Year !== b.Year) return b.Year - a.Year; // Latest year first
-                if (a.Round !== b.Round) return b.Round - a.Round; // Latest round first
-                
+
+                if (a.Year !== b.Year) return b.Year - a.Year;
+                if (a.Round !== b.Round) return b.Round - a.Round;
+
                 if ((a.Institute || "").localeCompare(b.Institute || "") !== 0) {
-                     return (a.Institute || "").localeCompare(b.Institute || "");
+                    return (a.Institute || "").localeCompare(b.Institute || "");
                 }
                 return (a["Academic Program Name"] || "").localeCompare(b["Academic Program Name"] || "");
             });
         }
 
         const responseData = {
-            success: true, count: filteredData.length,
+            success: true,
+            count: filteredData.length,
             message: filteredData.length === 0 ? "No matches found." : (userRankInt ? "Results with prediction." : "Filtered results."),
-            filterData: filteredData, appliedFilters: actualFiltersForCache,
-            homeStateApplied: normalizedUserState ? true : false // Indicate if home state filtering was applied
+            filterData: filteredData,
+            appliedFilters: actualFiltersForCache,
+            homeStateApplied: normalizedUserState ? true : false
         };
         await cacheResponse(cacheKey, responseData, userRankInt ? 1800 : 3600);
         res.status(200).json(responseData);
@@ -482,7 +497,6 @@ app.post('/filter', async (req, res) => {
 
 app.get('/suggest-institutes', async (req, res) => {
     const { term, type } = req.query;
-    // Cache key v3 includes type for institute suggestions
     const cacheKey = `suggest-institutes:v3_collegetype:${term?.toLowerCase() || 'all'}:${type?.toLowerCase() || 'all'}`;
     try {
         const cachedData = await getFromCache(cacheKey);
@@ -494,10 +508,9 @@ app.get('/suggest-institutes', async (req, res) => {
             query += ` AND "Institute" ILIKE $${paramIndex++}`;
             params.push(`%${term}%`);
         }
-        // Filter by College type if 'type' query param is present and not 'all'
         if (type && String(type).toLowerCase() !== 'all') {
             query += ` AND "College type" ILIKE $${paramIndex++}`;
-            params.push(type); // Assuming type is 'IIT', 'NIT', etc.
+            params.push(type);
         }
         query += ` ORDER BY "Institute" ASC LIMIT 20;`;
         const result = await pool.query(query, params);
@@ -512,9 +525,9 @@ app.get('/suggest-institutes', async (req, res) => {
 
 app.get('/suggest-programs', async (req, res) => {
     const { term } = req.query;
-     if (!term || term.trim() === '') {
-         return res.status(400).json({ success: false, message: "Search term required" });
-     }
+    if (!term || term.trim() === '') {
+        return res.status(400).json({ success: false, message: "Search term required" });
+    }
     const cacheKey = `suggest-programs:v2:${term.toLowerCase()}`;
     try {
         const cachedData = await getFromCache(cacheKey);
@@ -558,13 +571,13 @@ app.post('/rank-trends', async (req, res) => {
         const result = await pool.query(query, params);
         const trendsByYear = {};
         result.rows.forEach(row => {
-            if (row["Closing Rank"] !== null && !isNaN(row["Closing Rank"])){
+            if (row["Closing Rank"] !== null && !isNaN(row["Closing Rank"])) {
                 if (!trendsByYear[row.Year] || row.Round > trendsByYear[row.Year].Round) {
                     trendsByYear[row.Year] = row;
                 }
             }
         });
-        const finalData = Object.values(trendsByYear).sort((a,b) => a.Year - b.Year);
+        const finalData = Object.values(trendsByYear).sort((a, b) => a.Year - b.Year);
         const responseData = {
             success: true,
             message: finalData.length === 0 ? "No trend data found for the specified criteria." : "Trend data fetched.",
@@ -602,7 +615,7 @@ app.get('/filter-options', async (req, res) => {
             states: statesResult.rows.map(row => row.State)
         };
 
-        // Ensure "All" is present and consistently capitalized at the beginning of instituteTypes
+        // Ensure "All" is at the front of instituteTypes
         const allPresent = options.instituteTypes.some(it => String(it).toLowerCase() === 'all');
         if (!allPresent) {
             options.instituteTypes.unshift('All');
@@ -617,7 +630,6 @@ app.get('/filter-options', async (req, res) => {
         res.status(500).json({ success: false, message: "Error fetching filter options", error: error.message });
     }
 });
-
 
 app.get('/', (req, res) => { res.send('College Predictor API is running!'); });
 
